@@ -286,7 +286,8 @@ const Core = (() => {
       quotations: [],    // {id,indent_id,party_id,doc_type,doc_no,date,lines:[{item_id,name,qty,rate,amount}],total,status,created_at,confirmed_at}
       stock_ledger: [],  // {id,item_id,type,qty,ref_type,ref_id,party_id,date,notes}
       activity: [],      // {id,party_id,type,note,date}  -- lightweight timeline entries
-      calls: []          // {id,party_id,outcome,notes,date,lat,lng}
+      calls: [],         // {id,party_id,outcome,notes,date,lat,lng}
+      diary_stops: []    // {id,date,label,notes,address,lat,lng,ts,type} type: start|stop|end
     };
   }
 
@@ -432,6 +433,30 @@ const Core = (() => {
   function deleteCall(id) {
     db.calls = db.calls.filter(c => c.id !== id);
     persist();
+  }
+
+  /* ---------- DIARY (daily route / visit log) ---------- */
+
+  function getDiaryStops(date) {
+    return db.diary_stops.filter(s => s.date === date).sort((a, b) => a.ts.localeCompare(b.ts));
+  }
+  function addDiaryStop(date, { label, notes = '', address = '', lat = '', lng = '', type }) {
+    const stops = getDiaryStops(date);
+    const isFirst = stops.length === 0;
+    const stop = {
+      id: uid('stop'), date, label, notes, address, lat, lng,
+      ts: now(), type: isFirst ? 'start' : type
+    };
+    db.diary_stops.push(stop);
+    persist();
+    return stop;
+  }
+  function deleteDiaryStop(id) {
+    db.diary_stops = db.diary_stops.filter(s => s.id !== id);
+    persist();
+  }
+  function diaryDates() {
+    return Array.from(new Set(db.diary_stops.map(s => s.date))).sort().reverse();
   }
 
   /* ---------- ITEMS (Inventory master + pricing, shared by Quotation) ---------- */
@@ -585,7 +610,7 @@ const Core = (() => {
      to Supabase (upsert). On load and every 20s, pull all tables down and
      merge in anything from other devices. Simple, not clever — fine for a
      handful of users on a small dataset. */
-  const TABLES = ['parties', 'items', 'indents', 'quotations', 'stock_ledger', 'activity', 'calls'];
+  const TABLES = ['parties', 'items', 'indents', 'quotations', 'stock_ledger', 'activity', 'calls', 'diary_stops'];
   // Baked-in defaults so every device auto-connects with zero setup.
   // Safe to have in client-side code — this is a publishable/anon key,
   // meant to be public; real protection comes from Row Level Security
@@ -684,6 +709,8 @@ const Core = (() => {
     PARTY_TYPES, PARTY_STATUS, STATUS_HEX, CATEGORIES, SOURCES, LEAD_TYPES, CALL_OUTCOMES,
     // calls
     addCall, listCalls, deleteCall,
+    // diary
+    getDiaryStops, addDiaryStop, deleteDiaryStop, diaryDates,
     // items
     addItem, getItem, listItems, updateItemPrice,
     // stock
@@ -714,10 +741,26 @@ const Leads = (() => {
   let statusFilter = 'All';
   let catFilter = 'All';
   let urgencyFilter = 'All';
+  let leadsView = 'pipeline';   // 'pipeline' | 'diary'
+  let diaryDate = null;
 
   function todayStr() { return new Date().toISOString().slice(0, 10); }
 
   function render() {
+    if (leadsView === 'diary') { renderDiary(); return; }
+    renderPipeline();
+  }
+
+  function tabsHtml() {
+    return `
+      <div style="display:flex; gap:6px; margin-bottom:16px;">
+        <button class="btn ${leadsView === 'pipeline' ? '' : 'ghost'} sm view-tab" data-view="pipeline">Leads Pipeline</button>
+        <button class="btn ${leadsView === 'diary' ? '' : 'ghost'} sm view-tab" data-view="diary">📓 Diary</button>
+      </div>
+    `;
+  }
+
+  function renderPipeline() {
     const main = document.getElementById('main');
     let leads = Core.listParties({ type: typeFilter });
 
@@ -744,6 +787,8 @@ const Leads = (() => {
         </div>
         <button class="btn amber" id="btn-add-party">+ Add Lead</button>
       </div>
+
+      ${tabsHtml()}
 
       <div class="stat-row">
         <div class="stat"><div class="stat-num">${all.length}</div><div class="stat-label">${typeFilter === 'lead' ? 'Open Leads' : 'Clients'}</div></div>
@@ -784,6 +829,7 @@ const Leads = (() => {
     `;
 
     document.getElementById('btn-add-party').onclick = () => openLeadForm(null);
+    document.querySelectorAll('.view-tab').forEach(b => b.onclick = () => { leadsView = b.dataset.view; render(); });
     document.querySelectorAll('.filter-btn[data-group="type"]').forEach(b => b.onclick = () => { typeFilter = b.dataset.val; statusFilter = 'All'; render(); });
     document.querySelectorAll('.filter-btn[data-group="status"]').forEach(b => b.onclick = () => { statusFilter = b.dataset.val; render(); });
     document.querySelectorAll('.filter-btn[data-group="cat"]').forEach(b => b.onclick = () => { catFilter = b.dataset.val; render(); });
@@ -961,10 +1007,15 @@ const Leads = (() => {
             shortAddr = parts.join(', ') || (data.display_name || '').split(',').slice(0, 4).join(',').trim();
           }
           disp.innerHTML = `📍 <b>${esc(shortAddr)}</b><br><span style="color:var(--ink-dim);">±${Math.round(accuracy)}m accuracy</span>`;
+          _locData.address = shortAddr;
           const addrField = document.getElementById('lf-address');
           if (addrField && !addrField.value.trim()) addrField.value = shortAddr;
         })
-        .catch(() => { disp.innerHTML = `📍 ${lat.toFixed(6)}, ${lng.toFixed(6)}<br><span style="color:var(--ink-dim);">±${Math.round(accuracy)}m accuracy (offline — coords only)</span>`; });
+        .catch(() => {
+          const fallback = `${lat.toFixed(6)}, ${lng.toFixed(6)}`;
+          disp.innerHTML = `📍 ${fallback}<br><span style="color:var(--ink-dim);">±${Math.round(accuracy)}m accuracy (offline — coords only)</span>`;
+          _locData.address = fallback;
+        });
     }
 
     const timer = setTimeout(() => {
@@ -1089,6 +1140,189 @@ const Leads = (() => {
     document.getElementById('save-call').onclick = () => {
       Core.addCall(party_id, { outcome: document.getElementById('cf-outcome').value, notes: document.getElementById('cf-notes').value.trim() });
       closeModal(); toast('Call logged'); openPartyDetail(party_id);
+    };
+  }
+
+  /* ---------- DIARY: daily route log with real road distances ---------- */
+
+  function renderDiary() {
+    const main = document.getElementById('main');
+    if (!diaryDate) diaryDate = todayStr();
+    const isToday = diaryDate === todayStr();
+    const stops = Core.getDiaryStops(diaryDate);
+    const pastDates = Core.diaryDates().filter(d => d !== todayStr());
+
+    main.innerHTML = `
+      <div class="page-head">
+        <div>
+          <div class="page-title">Diary</div>
+          <div class="page-desc">Log stops as you visit sites through the day. End the day to get a shareable route summary.</div>
+        </div>
+      </div>
+
+      ${tabsHtml()}
+
+      <div style="display:flex; gap:8px; align-items:center; margin-bottom:14px; flex-wrap:wrap;">
+        <input type="date" id="diary-date-picker" value="${diaryDate}" max="${todayStr()}" style="width:auto;">
+        <span style="font-size:13px; color:var(--ink-dim);">${isToday ? "Today's Journey" : fmtDate(diaryDate)}</span>
+        ${isToday ? `
+          <div style="margin-left:auto; display:flex; gap:8px;">
+            <button class="btn amber sm" id="btn-add-stop">${stops.length ? '📍 Add Stop' : '🏢 Start Journey'}</button>
+            ${stops.length && stops[stops.length - 1].type !== 'end' ? `<button class="btn danger sm" id="btn-end-day">🏁 End Day</button>` : ''}
+          </div>
+        ` : ''}
+      </div>
+
+      <div id="diary-summary-card"></div>
+
+      <div class="card">
+        <div class="card-title">Stops (${stops.length})</div>
+        <div id="diary-stops-list">
+          ${stops.length ? '' : `<div class="empty">${isToday ? 'No stops logged yet. Tap "Start Journey" when you leave a place.' : 'No diary for this date.'}</div>`}
+        </div>
+      </div>
+    `;
+
+    document.querySelectorAll('.view-tab').forEach(b => b.onclick = () => { leadsView = b.dataset.view; render(); });
+    document.getElementById('diary-date-picker').onchange = (e) => { diaryDate = e.target.value; render(); };
+    const addBtn = document.getElementById('btn-add-stop');
+    if (addBtn) addBtn.onclick = () => openStopForm(stops.length === 0 ? 'start' : 'stop');
+    const endBtn = document.getElementById('btn-end-day');
+    if (endBtn) endBtn.onclick = () => openStopForm('end');
+
+    if (stops.length) renderStopsList(stops, isToday);
+  }
+
+  async function renderStopsList(stops, isToday) {
+    const listEl = document.getElementById('diary-stops-list');
+    const summaryEl = document.getElementById('diary-summary-card');
+    listEl.innerHTML = `<div class="hint">Calculating road distances…</div>`;
+
+    const points = stops.map(s => ({ lat: s.lat, lng: s.lng }));
+    const dists = await allRoadDists(points);
+
+    // stop cards
+    let html = '';
+    stops.forEach((stop, i) => {
+      const isFirst = i === 0, prev = i > 0 ? stops[i - 1] : null;
+      let travel = '';
+      if (prev) {
+        const tMins = Math.round((new Date(stop.ts) - new Date(prev.ts)) / 60000);
+        const roadKm = dists[i] ? dists[i].toFixed(1) + ' km by road' : null;
+        travel = `<div class="hint" style="margin:2px 0 2px 14px; border-left:2px dashed var(--line); padding-left:12px;">${tMins < 60 ? tMins + ' min' : (tMins / 60).toFixed(1) + ' hr'} travel${roadKm ? ' · 🛣️ ' + roadKm : ''}</div>`;
+      }
+      const dot = isFirst ? '🏢' : stop.type === 'end' ? '🏁' : '📍';
+      const label = isFirst ? 'START' : stop.type === 'end' ? 'END' : 'STOP';
+      html += travel + `
+        <div style="display:flex; gap:10px; padding:10px 0; border-bottom:1px solid var(--paper-dim);">
+          <div style="font-size:20px;">${dot}</div>
+          <div style="flex:1;">
+            <div style="display:flex; justify-content:space-between; align-items:flex-start;">
+              <div>
+                <b>${esc(stop.label)}</b>
+                <div style="font-size:11px; margin-top:2px;"><span class="badge new">${label}</span> <span style="color:var(--ink-dim);">🕐 ${fmtDate(stop.ts)}</span></div>
+              </div>
+              ${isToday ? `<button class="btn sm ghost del-stop-btn" data-id="${stop.id}">🗑</button>` : ''}
+            </div>
+            ${stop.address ? `<div class="hint" style="margin-top:4px;">📍 ${esc(stop.address)}</div>` : ''}
+            ${stop.notes ? `<div style="font-size:12px; font-style:italic; color:var(--ink-dim); margin-top:4px;">${esc(stop.notes)}</div>` : ''}
+          </div>
+        </div>
+      `;
+    });
+    listEl.innerHTML = html;
+    document.querySelectorAll('.del-stop-btn').forEach(b => b.onclick = () => {
+      if (!confirm('Delete this stop?')) return;
+      Core.deleteDiaryStop(b.dataset.id); toast('Stop deleted'); render();
+    });
+
+    // summary card with totals + downloadable text
+    let totalMins = 0, totalDist = 0;
+    for (let i = 1; i < stops.length; i++) {
+      totalMins += Math.round((new Date(stops[i].ts) - new Date(stops[i - 1].ts)) / 60000);
+      if (dists[i]) totalDist += dists[i];
+    }
+    const hrs = Math.floor(totalMins / 60), mins = totalMins % 60;
+    const summaryText = buildSummaryText(stops, dists, totalDist, hrs, mins);
+    window._diarySummaryText = summaryText;
+
+    summaryEl.innerHTML = `
+      <div class="card">
+        <div class="stat-row" style="margin-bottom:0;">
+          <div class="stat"><div class="stat-num">${stops.length}</div><div class="stat-label">Stops</div></div>
+          <div class="stat"><div class="stat-num">${totalDist.toFixed(1)}<span style="font-size:12px;">km</span></div><div class="stat-label">Road Dist</div></div>
+          <div class="stat"><div class="stat-num">${hrs > 0 ? hrs + 'h ' : ''}${mins}m</div><div class="stat-label">Duration</div></div>
+        </div>
+        <div style="display:flex; gap:8px; margin-top:12px;">
+          <button class="btn ghost sm" id="btn-download-summary">⬇ Download Report</button>
+          <button class="btn ghost sm" id="btn-share-summary">📤 Share</button>
+        </div>
+      </div>
+    `;
+    document.getElementById('btn-download-summary').onclick = () => downloadSummary(summaryText);
+    document.getElementById('btn-share-summary').onclick = () => shareSummary(summaryText);
+  }
+
+  function buildSummaryText(stops, dists, totalDist, hrs, mins) {
+    const readableDate = new Date(diaryDate + 'T00:00:00').toLocaleDateString('en-IN', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+    let lines = [`DAILY VISIT REPORT`, readableDate, ''];
+    stops.forEach((stop, i) => {
+      const mapsLink = (stop.lat && stop.lng) ? `https://maps.google.com/?q=${stop.lat},${stop.lng}` : null;
+      if (i === 0) {
+        lines.push(`Started from ${stop.label} — ${fmtDate(stop.ts)}`);
+      } else {
+        const prev = stops[i - 1];
+        const tMins = Math.round((new Date(stop.ts) - new Date(prev.ts)) / 60000);
+        const roadKm = dists[i] ? dists[i].toFixed(1) + ' km by road' : null;
+        lines.push(`  -> ${tMins < 60 ? tMins + ' min' : (tMins / 60).toFixed(1) + ' hr'} travel${roadKm ? ' · ' + roadKm : ''}`);
+        lines.push(`${stop.type === 'end' ? 'Returned to' : 'Visited'} ${stop.label} — ${fmtDate(stop.ts)}`);
+      }
+      if (stop.address) lines.push(`   ${stop.address}`);
+      if (mapsLink) lines.push(`   ${mapsLink}`);
+      if (stop.notes) lines.push(`   Note: ${stop.notes}`);
+    });
+    lines.push('', `Total Road Distance: ${totalDist.toFixed(1)} km`, `Total Duration: ${hrs > 0 ? hrs + 'h ' : ''}${mins} min`, `Total Stops: ${stops.length}`, '', `Generated by SSE Unified System`);
+    return lines.join('\n');
+  }
+
+  function downloadSummary(text) {
+    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `Visit_Report_${diaryDate}.txt`; a.click();
+    URL.revokeObjectURL(url);
+    toast('Report downloaded');
+  }
+  function shareSummary(text) {
+    if (navigator.share) navigator.share({ title: `Visit Report — ${diaryDate}`, text }).catch(() => { });
+    else navigator.clipboard.writeText(text).then(() => toast('Copied — paste into WhatsApp')).catch(() => toast('Copy not supported on this browser'));
+  }
+
+  function openStopForm(type) {
+    const isFirst = type === 'start';
+    const isEnd = type === 'end';
+    _locData = {};
+    showModal(isFirst ? '🏢 Journey Start' : isEnd ? '🏁 End of Day' : '📍 Add Stop', `
+      <div class="field"><label>${isFirst ? 'Starting Place' : isEnd ? 'Final Destination' : 'Place / Company Name'} *</label>
+        <input id="ds-label" placeholder="${isFirst ? 'e.g. Office, Home' : 'e.g. ABC Company, Godown'}" value="${isFirst ? 'Office' : ''}">
+      </div>
+      <div class="field"><label>Notes (optional)</label><input id="ds-notes" placeholder="e.g. Meeting with Mr. Kumar"></div>
+      <div class="field">
+        <label>GPS Location</label>
+        <button class="btn ghost sm" id="ds-gps-btn" type="button">📍 Capture GPS Location</button>
+        <div id="ds-loc-display" class="hint"></div>
+      </div>
+      <button class="btn ${isEnd ? 'danger' : 'amber'}" id="save-stop" style="width:100%; justify-content:center; margin-top:6px;">${isFirst ? '🏢 Start Journey' : isEnd ? '🏁 End My Day' : '📍 Save Stop'}</button>
+    `);
+    document.getElementById('ds-gps-btn').onclick = () => getLocation(document.getElementById('ds-gps-btn'), document.getElementById('ds-loc-display'));
+    document.getElementById('save-stop').onclick = () => {
+      const label = document.getElementById('ds-label').value.trim();
+      if (!label) { toast('Enter the place name'); return; }
+      Core.addDiaryStop(todayStr(), {
+        label, notes: document.getElementById('ds-notes').value.trim(),
+        address: _locData.address || '', lat: _locData.lat || '', lng: _locData.lng || '', type
+      });
+      closeModal(); toast(isFirst ? 'Journey started' : isEnd ? 'Day ended' : 'Stop added'); render();
     };
   }
 
@@ -1437,6 +1671,34 @@ function toast(msg) {
   el.textContent = msg;
   document.body.appendChild(el);
   setTimeout(() => el.remove(), 2400);
+}
+
+/* ---------- shared distance helpers (Leads GPS + Diary road distance) ---------- */
+function haversine(a, b, c, d) {
+  const R = 6371, dLat = (c - a) * Math.PI / 180, dLng = (d - b) * Math.PI / 180;
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(a * Math.PI / 180) * Math.cos(c * Math.PI / 180) * Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
+}
+// Real road distance via OSRM (free, no key). Falls back to haversine if offline.
+async function roadDist(lat1, lng1, lat2, lng2) {
+  if (!lat1 || !lng1 || !lat2 || !lng2) return null;
+  try {
+    const url = `https://router.project-osrm.org/route/v1/driving/${lng1},${lat1};${lng2},${lat2}?overview=false`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(6000) });
+    const data = await res.json();
+    if (data.code === 'Ok' && data.routes && data.routes[0]) return data.routes[0].distance / 1000;
+  } catch (e) { }
+  return haversine(lat1, lng1, lat2, lng2);
+}
+// points = [{lat,lng},...] -> returns [0, dist(0->1), dist(1->2), ...] in km
+async function allRoadDists(points) {
+  if (points.length < 2) return points.map(() => 0);
+  const promises = [];
+  for (let i = 1; i < points.length; i++) {
+    const p = points[i - 1], q = points[i];
+    promises.push((p.lat && p.lng && q.lat && q.lng) ? roadDist(+p.lat, +p.lng, +q.lat, +q.lng) : Promise.resolve(null));
+  }
+  return [0, ...(await Promise.all(promises))];
 }
 
 function showModal(title, bodyHtml) {

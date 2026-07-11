@@ -181,17 +181,36 @@ button { font-family: var(--sans); cursor: pointer; }
 /* ---------- badges ---------- */
 .badge { display: inline-block; padding: 2px 8px; border-radius: 20px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em; }
 .badge.new { background: #e6edf7; color: var(--navy-700); }
-.badge.contacted { background: #fdf1de; color: var(--amber-dark); }
-.badge.won { background: #e2f0e8; color: var(--green); }
+.badge.uncontacted { background: #f6e4e2; color: var(--red); }
+.badge.contacted { background: #ede7fb; color: #7c5cd1; }
+.badge.quoted { background: #fdf1de; color: var(--amber-dark); }
+.badge.agreed { background: #e2f0e8; color: var(--green); }
+.badge.closed { background: #e2f0e8; color: var(--green); }
 .badge.lost { background: #f6e4e2; color: var(--red); }
+.badge.won { background: #e2f0e8; color: var(--green); }
 .badge.active { background: #e2f0e8; color: var(--green); }
 .badge.requested { background: #eee; color: var(--ink-dim); }
 .badge.priced { background: #fdf1de; color: var(--amber-dark); }
-.badge.quoted { background: #e6edf7; color: var(--navy-700); }
-.badge.confirmed { background: #e2f0e8; color: var(--green); }
 .badge.draft { background: #eee; color: var(--ink-dim); }
 .badge.rejected { background: #f6e4e2; color: var(--red); }
 .badge.low { background: #f6e4e2; color: var(--red); }
+.badge.confirmed { background: #e2f0e8; color: var(--green); }
+
+.tag { display: inline-flex; align-items: center; gap: 4px; padding: 2px 9px; border-radius: 20px; font-size: 11px; font-weight: 600; background: var(--paper-dim); color: var(--ink-dim); }
+.tag.urg-overdue { background: #f6e4e2; color: var(--red); }
+.tag.urg-today { background: #fdf1de; color: var(--amber-dark); }
+.tag.urg-upcoming { background: #e6edf7; color: var(--navy-700); }
+
+.stage-pill { padding: 6px 12px; border-radius: 20px; font-size: 11px; font-weight: 700; cursor: pointer; border: 1.5px solid var(--line); background: #fff; color: var(--ink-dim); }
+.stage-pill.on { border-color: var(--navy-700); color: var(--navy-700); background: #eef2f8; }
+.stage-pill.lost.on { border-color: var(--red); color: var(--red); background: #f6e4e2; }
+.stage-pill.uncontacted.on { border-color: var(--red); color: var(--red); background: #f6e4e2; }
+
+.cat-opt { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 1.5px solid var(--line); border-radius: 8px; cursor: pointer; margin-bottom: 6px; }
+.cat-opt.on { border-color: var(--amber); background: #fff8ec; }
+.cat-opt .c-icon { font-size: 20px; }
+.cat-opt .c-label { font-weight: 700; font-size: 13px; color: var(--navy-950); }
+.cat-opt .c-sub { font-size: 11px; color: var(--ink-dim); }
 
 /* ---------- modal ---------- */
 .modal-bg { position: fixed; inset: 0; background: rgba(13,27,46,0.5); display: flex; align-items: center; justify-content: center; z-index: 50; }
@@ -266,7 +285,8 @@ const Core = (() => {
       indents: [],       // {id,party_id,lines:[{item_id,qty}],status,created_at,notes}
       quotations: [],    // {id,indent_id,party_id,doc_type,doc_no,date,lines:[{item_id,name,qty,rate,amount}],total,status,created_at,confirmed_at}
       stock_ledger: [],  // {id,item_id,type,qty,ref_type,ref_id,party_id,date,notes}
-      activity: []       // {id,party_id,type,note,date}  -- lightweight timeline entries
+      activity: [],      // {id,party_id,type,note,date}  -- lightweight timeline entries
+      calls: []          // {id,party_id,outcome,notes,date,lat,lng}
     };
   }
 
@@ -291,18 +311,37 @@ const Core = (() => {
     document.dispatchEvent(new CustomEvent('core:change'));
   }
 
-  /* ---------- PARTIES (Leads / Clients / Suppliers) ---------- */
+  /* ---------- PARTIES (Leads / Clients / Suppliers) ----------
+     Field set and pipeline match the original standalone Lead Manager
+     exactly, so this module behaves identically to what the team already
+     knows, just now feeding the shared spine. */
 
   const PARTY_TYPES = ['lead', 'customer', 'supplier'];
-  const PARTY_STATUS = ['new', 'contacted', 'won', 'lost', 'active'];
+  // 7-stage pipeline, verbatim from the original app.
+  const PARTY_STATUS = ['New', 'Uncontacted', 'Contacted', 'Quoted', 'Agreed', 'Closed', 'Lost'];
+  const STATUS_HEX = {
+    'New': '#3b82f6', 'Uncontacted': '#ef4444', 'Contacted': '#a78bfa',
+    'Quoted': '#f59e0b', 'Agreed': '#34d399', 'Closed': '#6ee7b7', 'Lost': '#ef4444'
+  };
+  // Construction-phase categories — tells sales what a site will need next.
+  const CATEGORIES = [
+    { key: 'Beginning', label: 'Beginning', sub: 'Pillars / Foundation', icon: '🧱' },
+    { key: 'Intermediate', label: 'Intermediate', sub: 'Wall Construction', icon: '🏗️' },
+    { key: 'Advanced', label: 'Advanced', sub: 'Plastering', icon: '🏠' }
+  ];
+  const SOURCES = ['Cold Call', 'Referral', 'Walk-in', 'WhatsApp', 'LinkedIn', 'Exhibition', 'Website', 'Other'];
+  const LEAD_TYPES = ['New Site', 'Existing Client'];
+  const CALL_OUTCOMES = ['No Answer', 'Callback Later', 'Not Interested', 'Interested', 'Meeting Fixed', 'Closed Deal'];
 
-  function addParty({ name, phone, email = '', address = '', gst = '', type = 'lead', source = '', notes = '' }) {
+  function addParty({ name, phone, email = '', address = '', gst = '', type = 'lead', source = 'Cold Call',
+    company = '', leadType = 'New Site', category = '', nextFollowUp = '', lat = '', lng = '', notes = '' }) {
     if (!name || !name.trim()) throw new Error('Party name is required');
     const existing = findPartyByNameOrPhone(name, phone);
     if (existing) return existing; // avoid duplicate lead/client records
     const party = {
       id: uid('party'), name: name.trim(), phone: phone || '', email, address, gst,
-      type, status: type === 'lead' ? 'new' : 'active', source, notes,
+      type, status: type === 'lead' ? 'New' : 'Closed', source, company, leadType, category,
+      nextFollowUp, lat, lng, notes,
       created_at: now(), updated_at: now()
     };
     db.parties.push(party);
@@ -343,11 +382,25 @@ const Core = (() => {
     const party = getParty(id);
     if (!party) return;
     party.type = 'customer';
-    party.status = 'active';
+    party.status = 'Closed';
     party.updated_at = now();
     logActivity(id, 'converted', 'Lead converted to client');
     persist();
     return party;
+  }
+
+  function updateParty(id, fields) {
+    const party = getParty(id);
+    if (!party) return;
+    Object.assign(party, fields, { updated_at: now() });
+    persist();
+    return party;
+  }
+
+  function deleteParty(id) {
+    db.parties = db.parties.filter(p => p.id !== id);
+    db.calls = db.calls.filter(c => c.party_id !== id);
+    persist();
   }
 
   function logActivity(party_id, type, note) {
@@ -358,9 +411,27 @@ const Core = (() => {
     const acts = db.activity.filter(a => a.party_id === party_id);
     const inds = db.indents.filter(i => i.party_id === party_id);
     const quos = db.quotations.filter(q => q.party_id === party_id);
+    const calls = db.calls.filter(c => c.party_id === party_id);
     return [...acts, ...inds.map(i => ({ id: i.id, type: 'indent', note: `Indent (${i.status})`, date: i.created_at })),
-      ...quos.map(q => ({ id: q.id, type: 'quotation', note: `${q.doc_type} ${q.doc_no} — ${q.status}`, date: q.created_at }))]
+      ...quos.map(q => ({ id: q.id, type: 'quotation', note: `${q.doc_type} ${q.doc_no} — ${q.status}`, date: q.created_at })),
+      ...calls.map(c => ({ id: c.id, type: 'call', note: `Call — ${c.outcome}${c.notes ? ': ' + c.notes : ''}`, date: c.date }))]
       .sort((a, b) => a.date.localeCompare(b.date));
+  }
+
+  function addCall(party_id, { outcome, notes = '', lat = '', lng = '' }) {
+    if (!getParty(party_id)) throw new Error('Unknown party for call');
+    const call = { id: uid('call'), party_id, outcome, notes, lat, lng, date: now() };
+    db.calls.push(call);
+    logActivity(party_id, 'call', `Call logged — ${outcome}`);
+    persist();
+    return call;
+  }
+  function listCalls(party_id) {
+    return db.calls.filter(c => c.party_id === party_id).sort((a, b) => b.date.localeCompare(a.date));
+  }
+  function deleteCall(id) {
+    db.calls = db.calls.filter(c => c.id !== id);
+    persist();
   }
 
   /* ---------- ITEMS (Inventory master + pricing, shared by Quotation) ---------- */
@@ -493,7 +564,7 @@ const Core = (() => {
     if (indent) indent.status = 'confirmed';
     const party = getParty(quotation.party_id);
     if (party && party.type === 'lead') {
-      updatePartyStatus(party.id, 'won', `Won via ${quotation.doc_type} ${quotation.doc_no}`);
+      updatePartyStatus(party.id, 'Closed', `Won via ${quotation.doc_type} ${quotation.doc_no}`);
     } else {
       logActivity(quotation.party_id, 'sale', `${quotation.doc_type} ${quotation.doc_no} confirmed — ₹${quotation.total}`);
     }
@@ -514,7 +585,7 @@ const Core = (() => {
      to Supabase (upsert). On load and every 20s, pull all tables down and
      merge in anything from other devices. Simple, not clever — fine for a
      handful of users on a small dataset. */
-  const TABLES = ['parties', 'items', 'indents', 'quotations', 'stock_ledger', 'activity'];
+  const TABLES = ['parties', 'items', 'indents', 'quotations', 'stock_ledger', 'activity', 'calls'];
   // Baked-in defaults so every device auto-connects with zero setup.
   // Safe to have in client-side code — this is a publishable/anon key,
   // meant to be public; real protection comes from Row Level Security
@@ -609,8 +680,10 @@ const Core = (() => {
 
   return {
     // parties
-    addParty, getParty, listParties, updatePartyStatus, convertLeadToClient, getPartyTimeline,
-    PARTY_TYPES, PARTY_STATUS,
+    addParty, getParty, listParties, updatePartyStatus, updateParty, deleteParty, convertLeadToClient, getPartyTimeline,
+    PARTY_TYPES, PARTY_STATUS, STATUS_HEX, CATEGORIES, SOURCES, LEAD_TYPES, CALL_OUTCOMES,
+    // calls
+    addCall, listCalls, deleteCall,
     // items
     addItem, getItem, listItems, updateItemPrice,
     // stock
@@ -629,16 +702,39 @@ const Core = (() => {
 /* ===== leads.js ===== */
 /* =========================================================================
    LEADS / CLIENTS module
-   Pipeline stage 1: Lead -> Client
+   Rebuilt to match the original standalone Lead Manager exactly: 7-stage
+   pipeline, construction-phase categories, sources, lead type, follow-up
+   urgency filters, GPS capture, and call logging.
+   Pipeline stage 1 of the unified system: Lead -> Client
    ========================================================================= */
 
 const Leads = (() => {
 
-  let activeFilter = 'lead';
+  let typeFilter = 'lead';      // 'lead' | 'customer'
+  let statusFilter = 'All';
+  let catFilter = 'All';
+  let urgencyFilter = 'All';
+
+  function todayStr() { return new Date().toISOString().slice(0, 10); }
 
   function render() {
     const main = document.getElementById('main');
-    const leads = Core.listParties({ type: activeFilter });
+    let leads = Core.listParties({ type: typeFilter });
+
+    if (statusFilter !== 'All') leads = leads.filter(l => l.status === statusFilter);
+    if (catFilter !== 'All') leads = leads.filter(l => l.category === catFilter);
+    if (urgencyFilter !== 'All') {
+      const today = todayStr();
+      leads = leads.filter(l => {
+        if (urgencyFilter === 'overdue') return l.nextFollowUp && l.nextFollowUp < today && l.status !== 'Closed' && l.status !== 'Lost';
+        if (urgencyFilter === 'today') return l.nextFollowUp === today;
+        if (urgencyFilter === 'upcoming') return l.nextFollowUp && l.nextFollowUp > today;
+        return true;
+      });
+    }
+
+    const all = Core.listParties({ type: typeFilter });
+    const overdueCount = all.filter(l => l.nextFollowUp && l.nextFollowUp < todayStr() && l.status !== 'Closed' && l.status !== 'Lost').length;
 
     main.innerHTML = `
       <div class="page-head">
@@ -649,120 +745,244 @@ const Leads = (() => {
         <button class="btn amber" id="btn-add-party">+ Add Lead</button>
       </div>
 
-      ${pipelineStrip('leads')}
-
       <div class="stat-row">
-        <div class="stat"><div class="stat-num">${Core.listParties({ type: 'lead' }).length}</div><div class="stat-label">Open Leads</div></div>
-        <div class="stat"><div class="stat-num">${Core.listParties({ type: 'customer' }).length}</div><div class="stat-label">Clients</div></div>
-        <div class="stat"><div class="stat-num">${Core.listParties({ type: 'lead', status: 'won' }).length}</div><div class="stat-label">Won</div></div>
-        <div class="stat"><div class="stat-num">${Core.listParties({ type: 'lead', status: 'lost' }).length}</div><div class="stat-label">Lost</div></div>
+        <div class="stat"><div class="stat-num">${all.length}</div><div class="stat-label">${typeFilter === 'lead' ? 'Open Leads' : 'Clients'}</div></div>
+        <div class="stat"><div class="stat-num" style="color:${overdueCount ? 'var(--red)' : 'inherit'}">${overdueCount}</div><div class="stat-label">Overdue Follow-ups</div></div>
+        <div class="stat"><div class="stat-num">${Core.listParties({ type: 'lead', status: 'Closed' }).length}</div><div class="stat-label">Closed Won</div></div>
+        <div class="stat"><div class="stat-num">${Core.listParties({ type: 'lead', status: 'Lost' }).length}</div><div class="stat-label">Lost</div></div>
+      </div>
+
+      <div style="display:flex; gap:6px; margin-bottom:10px;">
+        ${filterBtn('type', 'lead', 'Leads')}
+        ${filterBtn('type', 'customer', 'Clients')}
+      </div>
+
+      <div class="card" style="padding-bottom:10px;">
+        <div style="font-size:11px; color:var(--ink-dim); text-transform:uppercase; letter-spacing:.04em; margin-bottom:6px;">Pipeline Stage</div>
+        <div style="display:flex; gap:6px; flex-wrap:wrap; margin-bottom:14px;">
+          ${chip('status', 'All', 'All')}
+          ${Core.PARTY_STATUS.map(s => chip('status', s, statusLabel(s))).join('')}
+        </div>
+        <div style="font-size:11px; color:var(--ink-dim); text-transform:uppercase; letter-spacing:.04em; margin-bottom:6px;">Construction Phase</div>
+        <div style="display:flex; gap:6px; flex-wrap:wrap; margin-bottom:14px;">
+          ${chip('cat', 'All', '🏷️ All Types')}
+          ${Core.CATEGORIES.map(c => chip('cat', c.key, `${c.icon} ${c.label}`)).join('')}
+        </div>
+        <div style="font-size:11px; color:var(--ink-dim); text-transform:uppercase; letter-spacing:.04em; margin-bottom:6px;">Follow-up Due</div>
+        <div style="display:flex; gap:6px; flex-wrap:wrap;">
+          ${chip('urg', 'All', '⏰ All Due')}
+          ${chip('urg', 'overdue', '🔴 Overdue')}
+          ${chip('urg', 'today', '🟡 Due Today')}
+          ${chip('urg', 'upcoming', '🔵 Upcoming')}
+        </div>
       </div>
 
       <div class="card">
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
-          <div class="card-title" style="margin-bottom:0;">Party List</div>
-          <div style="display:flex; gap:6px;">
-            ${filterBtn('lead', 'Leads')}
-            ${filterBtn('customer', 'Clients')}
+        <div class="card-title">Party List (${leads.length})</div>
+        ${leads.length ? cardsList(leads) : `<div class="empty">No ${typeFilter === 'lead' ? 'leads' : 'clients'} match this filter. <b>Add one or adjust filters.</b></div>`}
+      </div>
+    `;
+
+    document.getElementById('btn-add-party').onclick = () => openLeadForm(null);
+    document.querySelectorAll('.filter-btn[data-group="type"]').forEach(b => b.onclick = () => { typeFilter = b.dataset.val; statusFilter = 'All'; render(); });
+    document.querySelectorAll('.filter-btn[data-group="status"]').forEach(b => b.onclick = () => { statusFilter = b.dataset.val; render(); });
+    document.querySelectorAll('.filter-btn[data-group="cat"]').forEach(b => b.onclick = () => { catFilter = b.dataset.val; render(); });
+    document.querySelectorAll('.filter-btn[data-group="urg"]').forEach(b => b.onclick = () => { urgencyFilter = b.dataset.val; render(); });
+    document.querySelectorAll('.party-card').forEach(r => r.onclick = () => openPartyDetail(r.dataset.id));
+  }
+
+  function statusLabel(s) {
+    const icons = { New: '🆕', Uncontacted: '📵', Contacted: '📞', Quoted: '📄', Agreed: '🤝', Closed: '✅', Lost: '❌' };
+    return `${icons[s] || ''} ${s}`;
+  }
+
+  function chip(group, val, label) {
+    const active = (group === 'status' ? statusFilter : group === 'cat' ? catFilter : urgencyFilter) === val;
+    return `<button class="btn sm ${active ? '' : 'ghost'} filter-btn" data-group="${group}" data-val="${val}" style="font-size:11.5px; padding:5px 10px;">${label}</button>`;
+  }
+  function filterBtn(group, val, label) {
+    const active = typeFilter === val;
+    return `<button class="btn ${active ? '' : 'ghost'} sm filter-btn" data-group="${group}" data-val="${val}">${label}</button>`;
+  }
+
+  function cardsList(rows) {
+    const today = todayStr();
+    return rows.map(l => {
+      const cat = Core.CATEGORIES.find(c => c.key === l.category);
+      let urgTag = '';
+      if (l.nextFollowUp) {
+        if (l.nextFollowUp < today && l.status !== 'Closed' && l.status !== 'Lost') urgTag = `<span class="tag urg-overdue">Overdue ${fmtDate(l.nextFollowUp)}</span>`;
+        else if (l.nextFollowUp === today) urgTag = `<span class="tag urg-today">Due Today</span>`;
+        else if (l.nextFollowUp > today) urgTag = `<span class="tag urg-upcoming">Follow-up ${fmtDate(l.nextFollowUp)}</span>`;
+      }
+      return `
+        <div class="party-card" data-id="${l.id}" style="cursor:pointer; padding:12px 4px; border-bottom:1px solid var(--paper-dim); display:flex; align-items:center; gap:12px;">
+          <div style="font-size:22px; width:30px; text-align:center;">${cat ? cat.icon : '👤'}</div>
+          <div style="flex:1; min-width:0;">
+            <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+              <b>${esc(l.company || l.name)}</b>
+              <span class="badge ${(l.status || 'new').toLowerCase()}">${esc(l.status)}</span>
+              ${l.leadType ? `<span style="font-size:11px; color:var(--ink-dim);">${l.leadType === 'New Site' ? '🆕' : '🔄'} ${esc(l.leadType)}</span>` : ''}
+            </div>
+            <div style="font-size:12px; color:var(--ink-dim); margin-top:2px;">${esc(l.name)}${l.phone ? ' · ' + esc(l.phone) : ''}${l.source ? ' · ' + esc(l.source) : ''}</div>
           </div>
+          <div>${urgTag}</div>
         </div>
-        ${leads.length ? table(leads) : `<div class="empty">No ${activeFilter === 'lead' ? 'leads' : 'clients'} yet. <b>Add one to get started.</b></div>`}
-      </div>
-    `;
-
-    document.getElementById('btn-add-party').onclick = openAddModal;
-    document.querySelectorAll('.filter-btn').forEach(b => b.onclick = () => { activeFilter = b.dataset.f; render(); });
-    document.querySelectorAll('.party-row').forEach(r => r.onclick = () => openPartyDetail(r.dataset.id));
+      `;
+    }).join('');
   }
 
-  function filterBtn(f, label) {
-    return `<button class="btn ${activeFilter === f ? '' : 'ghost'} sm filter-btn" data-f="${f}">${label}</button>`;
-  }
+  /* ---------- Lead form: name/phone/company/source, pipeline stage picker,
+     category picker, follow-up date, address + GPS, notes ---------- */
 
-  function pipelineStrip(current) {
-    const steps = [
-      ['leads', 'Lead / Client'], ['inventory', 'Pricing / Stock'], ['quotation', 'Indent → Quotation']
-    ];
-    return `<div class="pipeline">` + steps.map(([key, label], i) =>
-      `<span class="pipe-step ${key === current ? 'current' : ''}">${i + 1}. ${label}</span>` +
-      (i < steps.length - 1 ? `<span class="pipe-arrow">→</span>` : '')
-    ).join('') + `</div>`;
-  }
+  let _editingId = null;
+  let _locData = {};
 
-  function table(rows) {
-    return `
-      <table>
-        <thead><tr><th>Name</th><th>Phone</th><th>Status</th><th>Last Update</th><th></th></tr></thead>
-        <tbody>
-          ${rows.map(p => `
-            <tr class="party-row" data-id="${p.id}" style="cursor:pointer;">
-              <td><b>${esc(p.name)}</b></td>
-              <td>${esc(p.phone) || '—'}</td>
-              <td><span class="badge ${p.status}">${p.status}</span></td>
-              <td>${fmtDate(p.updated_at)}</td>
-              <td style="text-align:right;">
-                ${p.type === 'lead' ? `<button class="btn sm amber convert-btn" data-id="${p.id}">Convert to Client</button>` : ''}
-              </td>
-            </tr>
-          `).join('')}
-        </tbody>
-      </table>
-    `;
-  }
+  function openLeadForm(id) {
+    _editingId = id;
+    _locData = {};
+    const l = id ? Core.getParty(id) : {};
+    const status = l.status || 'New';
 
-  function openAddModal() {
-    showModal('Add Lead', `
-      <div class="field"><label>Name *</label><input id="f-name" placeholder="Client / business name"></div>
+    showModal(id ? 'Edit Lead' : 'Add Lead', `
+      <div class="field"><label>Name *</label><input id="lf-name" value="${esc(l.name || '')}" placeholder="Person name at site"></div>
+      <div class="field"><label>Phone</label><input id="lf-phone" value="${esc(l.phone || '')}" placeholder="+91 98765 43210"></div>
       <div class="field-row">
-        <div class="field"><label>Phone</label><input id="f-phone" placeholder="10-digit number"></div>
-        <div class="field"><label>GST No.</label><input id="f-gst" placeholder="Optional"></div>
+        <div class="field"><label>Company / Site Name</label><input id="lf-company" value="${esc(l.company || '')}" placeholder="Site or company"></div>
+        <div class="field"><label>Source</label>
+          <select id="lf-source">${Core.SOURCES.map(s => `<option ${((l.source || 'Cold Call') === s) ? 'selected' : ''}>${s}</option>`).join('')}</select>
+        </div>
       </div>
-      <div class="field"><label>Address</label><input id="f-address" placeholder="Optional"></div>
-      <div class="field"><label>Source</label>
-        <select id="f-source">
-          <option value="field-visit">Field visit</option>
-          <option value="referral">Referral</option>
-          <option value="call-in">Call-in</option>
-          <option value="other">Other</option>
-        </select>
+      <div class="field"><label>Lead Type</label>
+        <select id="lf-leadtype">${Core.LEAD_TYPES.map(t => `<option ${(l.leadType || 'New Site') === t ? 'selected' : ''}>${t}</option>`).join('')}</select>
       </div>
-      <div class="field"><label>Notes</label><textarea id="f-notes" rows="2"></textarea></div>
-      <button class="btn amber" id="save-party" style="width:100%; justify-content:center; margin-top:6px;">Save Lead</button>
+
+      <label>Construction Phase</label>
+      <div id="cat-picker" style="margin-bottom:12px;">
+        ${Core.CATEGORIES.map(c => `
+          <div class="cat-opt ${l.category === c.key ? 'on' : ''}" data-cat="${c.key}">
+            <div class="c-icon">${c.icon}</div>
+            <div><div class="c-label">${c.label}</div><div class="c-sub">${c.sub}</div></div>
+          </div>
+        `).join('')}
+      </div>
+      <input type="hidden" id="lf-category" value="${esc(l.category || '')}">
+
+      <label>Pipeline Stage</label>
+      <div style="background:var(--paper-dim); border-radius:8px; padding:10px; margin-bottom:12px;">
+        <div style="display:flex; flex-wrap:wrap; gap:6px; margin-bottom:8px;">
+          ${['New', 'Contacted', 'Quoted', 'Agreed', 'Closed'].map(s => `<div class="stage-pill ${status === s ? 'on' : ''}" data-stage="${s}">${s}</div>`).join('')}
+        </div>
+        <div style="display:flex; gap:6px; flex-wrap:wrap;">
+          <div class="stage-pill uncontacted ${status === 'Uncontacted' ? 'on' : ''}" data-stage="Uncontacted">📵 Uncontacted</div>
+          <div class="stage-pill lost ${status === 'Lost' ? 'on' : ''}" data-stage="Lost">❌ Lost</div>
+        </div>
+      </div>
+      <input type="hidden" id="lf-status" value="${esc(status)}">
+
+      <div class="field"><label>Next Follow-up</label><input id="lf-followup" type="date" value="${l.nextFollowUp || ''}"></div>
+
+      <div class="field">
+        <label>Location</label>
+        <button class="btn ghost sm" id="lf-gps-btn" type="button">📍 Capture Current Location</button>
+        <div id="lf-loc-display" class="hint">${l.lat ? `Saved: ${l.lat}, ${l.lng}` : ''}</div>
+        <input id="lf-address" style="margin-top:6px;" value="${esc(l.address || '')}" placeholder="Address (auto-fills if GPS used, or type manually)">
+      </div>
+
+      <div class="field"><label>Notes</label><textarea id="lf-notes" rows="2">${esc(l.notes || '')}</textarea></div>
+
+      <div style="display:flex; gap:8px;">
+        <button class="btn amber" id="save-lead" style="flex:1; justify-content:center;">${id ? 'Save Changes' : 'Save Lead'}</button>
+        ${id ? `<button class="btn danger" id="del-lead">Delete</button>` : ''}
+      </div>
     `);
-    document.getElementById('save-party').onclick = () => {
-      const name = document.getElementById('f-name').value.trim();
-      if (!name) { toast('Name is required'); return; }
-      Core.addParty({
-        name, phone: document.getElementById('f-phone').value.trim(),
-        gst: document.getElementById('f-gst').value.trim(),
-        address: document.getElementById('f-address').value.trim(),
-        source: document.getElementById('f-source').value,
-        notes: document.getElementById('f-notes').value.trim(),
-        type: 'lead'
-      });
-      closeModal();
-      toast('Lead added');
-      render();
+
+    document.querySelectorAll('.cat-opt').forEach(el => el.onclick = () => {
+      document.querySelectorAll('.cat-opt').forEach(x => x.classList.remove('on'));
+      el.classList.add('on');
+      document.getElementById('lf-category').value = el.dataset.cat;
+    });
+    document.querySelectorAll('.stage-pill').forEach(el => el.onclick = () => {
+      document.querySelectorAll('.stage-pill').forEach(x => x.classList.remove('on'));
+      el.classList.add('on');
+      document.getElementById('lf-status').value = el.dataset.stage;
+    });
+    document.getElementById('lf-gps-btn').onclick = captureLoc;
+
+    document.getElementById('save-lead').onclick = () => saveLead(id);
+    const delBtn = document.getElementById('del-lead');
+    if (delBtn) delBtn.onclick = () => {
+      if (!confirm('Delete this lead? This cannot be undone.')) return;
+      Core.deleteParty(id); closeModal(); toast('Lead deleted'); render();
     };
   }
+
+  function captureLoc() {
+    const btn = document.getElementById('lf-gps-btn');
+    const disp = document.getElementById('lf-loc-display');
+    if (!navigator.geolocation) { disp.textContent = 'GPS not available on this device/browser.'; return; }
+    btn.textContent = '📡 Getting location…';
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        _locData = { lat: pos.coords.latitude.toFixed(6), lng: pos.coords.longitude.toFixed(6) };
+        disp.textContent = `Captured: ${_locData.lat}, ${_locData.lng}`;
+        btn.textContent = '📍 Recapture Location';
+      },
+      (err) => { disp.textContent = 'Could not get location: ' + err.message; btn.textContent = '📍 Capture Current Location'; },
+      { enableHighAccuracy: true, timeout: 12000 }
+    );
+  }
+
+  function saveLead(id) {
+    const name = document.getElementById('lf-name').value.trim();
+    if (!name) { toast('Name is required'); return; }
+    const fields = {
+      name,
+      phone: document.getElementById('lf-phone').value.trim(),
+      company: document.getElementById('lf-company').value.trim(),
+      source: document.getElementById('lf-source').value,
+      leadType: document.getElementById('lf-leadtype').value,
+      category: document.getElementById('lf-category').value,
+      status: document.getElementById('lf-status').value,
+      nextFollowUp: document.getElementById('lf-followup').value,
+      address: document.getElementById('lf-address').value.trim(),
+      lat: _locData.lat || (id ? Core.getParty(id).lat : ''),
+      lng: _locData.lng || (id ? Core.getParty(id).lng : ''),
+      notes: document.getElementById('lf-notes').value.trim(),
+    };
+    if (id) {
+      Core.updateParty(id, fields);
+      closeModal(); toast('Lead updated'); render();
+    } else {
+      Core.addParty(Object.assign({ type: 'lead' }, fields));
+      closeModal(); toast('Lead saved'); render();
+    }
+  }
+
+  /* ---------- Party detail: timeline + calls + convert/indent actions ---------- */
 
   function openPartyDetail(id) {
     const p = Core.getParty(id);
     if (!p) return;
     const timeline = Core.getPartyTimeline(id);
-    showModal(p.name, `
-      <div style="display:flex; gap:8px; margin-bottom:14px; flex-wrap:wrap;">
-        <span class="badge ${p.status}">${p.status}</span>
-        <span class="badge new" style="background:var(--paper-dim); color:var(--ink-dim);">${p.type}</span>
+    const cat = Core.CATEGORIES.find(c => c.key === p.category);
+
+    showModal(p.company || p.name, `
+      <div style="display:flex; gap:8px; margin-bottom:14px; flex-wrap:wrap; align-items:center;">
+        <span class="badge ${(p.status || 'new').toLowerCase()}">${esc(p.status)}</span>
+        ${cat ? `<span class="tag">${cat.icon} ${cat.label}</span>` : ''}
+        ${p.leadType ? `<span class="tag">${p.leadType}</span>` : ''}
       </div>
-      <div style="font-size:13px; color:var(--ink-dim); margin-bottom:14px;">
+      <div style="font-size:13px; color:var(--ink-dim); margin-bottom:14px; line-height:1.7;">
+        ${p.name ? `👤 ${esc(p.name)}<br>` : ''}
         ${p.phone ? `📞 ${esc(p.phone)}<br>` : ''}
         ${p.address ? `📍 ${esc(p.address)}<br>` : ''}
-        ${p.gst ? `GST: ${esc(p.gst)}` : ''}
+        ${p.nextFollowUp ? `📅 Follow-up: ${fmtDate(p.nextFollowUp)}<br>` : ''}
+        ${p.source ? `Source: ${esc(p.source)}` : ''}
       </div>
 
       <div class="card-title">Timeline</div>
-      <div style="max-height:180px; overflow-y:auto; margin-bottom:16px;">
+      <div style="max-height:170px; overflow-y:auto; margin-bottom:14px;">
         ${timeline.length ? timeline.map(t => `
           <div style="font-size:12.5px; padding:6px 0; border-bottom:1px solid var(--paper-dim);">
             <span style="color:var(--ink-dim);">${fmtDate(t.date)}</span> — ${esc(t.note)}
@@ -771,27 +991,33 @@ const Leads = (() => {
       </div>
 
       <div style="display:flex; gap:8px; flex-wrap:wrap;">
-        ${p.type === 'lead' ? `<button class="btn amber" id="act-convert">Convert to Client</button>` : ''}
-        ${p.type === 'lead' && p.status !== 'lost' ? `<button class="btn danger" id="act-lost">Mark Lost</button>` : ''}
-        <button class="btn ghost" id="act-indent">Raise Indent →</button>
+        <button class="btn ghost sm" id="act-edit">Edit</button>
+        <button class="btn ghost sm" id="act-call">📞 Log a Call</button>
+        ${p.type === 'lead' ? `<button class="btn amber sm" id="act-convert">Convert to Client</button>` : ''}
+        <button class="btn ghost sm" id="act-indent">Raise Indent →</button>
       </div>
     `);
+
+    document.getElementById('act-edit').onclick = () => { closeModal(); openLeadForm(id); };
+    document.getElementById('act-call').onclick = () => openCallForm(id);
     const convertBtn = document.getElementById('act-convert');
     if (convertBtn) convertBtn.onclick = () => { Core.convertLeadToClient(id); closeModal(); toast('Converted to client'); render(); };
-    const lostBtn = document.getElementById('act-lost');
-    if (lostBtn) lostBtn.onclick = () => { Core.updatePartyStatus(id, 'lost'); closeModal(); toast('Marked lost'); render(); };
     document.getElementById('act-indent').onclick = () => { closeModal(); App.go('quotation', { newIndentFor: id }); };
   }
 
-  // event delegation for the inline "Convert to Client" button in the table
-  document.addEventListener('click', (e) => {
-    if (e.target.classList.contains('convert-btn')) {
-      e.stopPropagation();
-      Core.convertLeadToClient(e.target.dataset.id);
-      toast('Converted to client');
-      render();
-    }
-  });
+  function openCallForm(party_id) {
+    showModal('Log a Call', `
+      <div class="field"><label>Outcome</label>
+        <select id="cf-outcome">${Core.CALL_OUTCOMES.map(o => `<option>${o}</option>`).join('')}</select>
+      </div>
+      <div class="field"><label>Notes</label><textarea id="cf-notes" rows="2" placeholder="What was discussed"></textarea></div>
+      <button class="btn amber" id="save-call" style="width:100%; justify-content:center;">Save Call</button>
+    `);
+    document.getElementById('save-call').onclick = () => {
+      Core.addCall(party_id, { outcome: document.getElementById('cf-outcome').value, notes: document.getElementById('cf-notes').value.trim() });
+      closeModal(); toast('Call logged'); openPartyDetail(party_id);
+    };
+  }
 
   return { render };
 })();
@@ -1039,7 +1265,7 @@ const Quotation = (() => {
 
     showModal('New Indent', `
       <div class="field"><label>Party</label>
-        <select id="f-party">${parties.map(p => `<option value="${p.id}" ${p.id === presetPartyId ? 'selected' : ''}>${esc(p.name)} (${p.type})</option>`).join('')}</select>
+        <select id="f-party">${parties.map(p => `<option value="${p.id}" ${p.id === presetPartyId ? 'selected' : ''}>${esc(p.company || p.name)} (${p.type})</option>`).join('')}</select>
       </div>
       <label>Items Requested</label>
       <div id="indent-lines"></div>
@@ -1224,7 +1450,7 @@ const App = (() => {
     const parties = Core._db().parties;
     const items = Core._db().items;
     const quotations = Core._db().quotations;
-    const leads = parties.filter(p => p.type === 'lead' && p.status !== 'won' && p.status !== 'lost');
+    const leads = parties.filter(p => p.type === 'lead' && p.status !== 'Closed' && p.status !== 'Lost');
     const lowStock = Core.lowStockItems();
     const pendingConfirm = quotations.filter(q => q.status === 'draft');
     const confirmedValue = quotations.filter(q => q.status === 'confirmed').reduce((s, q) => s + q.total, 0);

@@ -4,6 +4,8 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>SSE — Unified System</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <style>
 :root {
   --navy-950: #0d1b2e;
@@ -281,7 +283,7 @@ const Core = (() => {
   function emptyDB() {
     return {
       parties: [],      // {id,name,phone,email,address,gst,type,status,source,notes,created_at,updated_at}
-      items: [],        // {id,name,category,brand,unit,cost_price,sell_price,hsn,stock_qty,low_stock_threshold}
+      items: [],        // {id,name,category,brand,unit,cost_price,sell_price,hsn,stock_qty,min_stock}
       indents: [],       // {id,party_id,lines:[{item_id,qty}],status,created_at,notes}
       quotations: [],    // {id,indent_id,party_id,doc_type,doc_no,date,lines:[{item_id,name,qty,rate,amount}],total,status,created_at,confirmed_at}
       stock_ledger: [],  // {id,item_id,type,qty,ref_type,ref_id,party_id,date,notes}
@@ -298,12 +300,25 @@ const Core = (() => {
       const raw = localStorage.getItem(DB_KEY);
       if (!raw) return emptyDB();
       const parsed = JSON.parse(raw);
-      // guard against missing keys if schema grows later
-      return Object.assign(emptyDB(), parsed);
+      const merged = Object.assign(emptyDB(), parsed);
+      migrateItems(merged);
+      return merged;
     } catch (e) {
       console.error('Core: failed to load DB, starting fresh', e);
       return emptyDB();
     }
+  }
+
+  // one-time backward-compat: items saved before the min_stock rename
+  // carried a low_stock_threshold field instead — carry that value over.
+  function migrateItems(state) {
+    (state.items || []).forEach(i => {
+      if (i.min_stock === undefined && i.low_stock_threshold !== undefined) {
+        i.min_stock = i.low_stock_threshold;
+        delete i.low_stock_threshold;
+      }
+      if (i.min_stock === undefined) i.min_stock = 0;
+    });
   }
 
   function persist() {
@@ -459,14 +474,31 @@ const Core = (() => {
     return Array.from(new Set(db.diary_stops.map(s => s.date))).sort().reverse();
   }
 
-  /* ---------- ITEMS (Inventory master + pricing, shared by Quotation) ---------- */
+  /* ---------- ITEMS (Inventory master + pricing, shared by Quotation) ----------
+     Brand + wire-colour / pipe-size matrix logic matches the original
+     standalone Godown Inventory app exactly. */
 
-  function addItem({ name, category = '', brand = '', unit = 'Nos', cost_price = 0, sell_price = 0, hsn = '', low_stock_threshold = 0 }) {
+  const WIRE_COLORS = ['RED', 'YELLOW', 'GREEN', 'BLUE', 'BLACK', 'WHITE', 'GREY'];
+  const PIPE_SIZES = ['15MM', '20MM', '25MM', '32MM', '40MM', '50MM', '63MM', '75MM', '90MM', '100MM', '110MM', '125MM', '150MM', '160MM', '200MM'];
+  const CS_BG = { RED: '#e53935', YELLOW: '#FDD835', GREEN: '#7CB342', BLUE: '#1E88E5', BLACK: '#212121', WHITE: '#f5f5f5', GREY: '#9E9E9E' };
+  const CS_TX = { RED: '#fff', YELLOW: '#333', GREEN: '#fff', BLUE: '#fff', BLACK: '#FF8F00', WHITE: '#333', GREY: '#fff' };
+
+  function isWire(item) { const n = (item.name || '').toUpperCase(); return n.includes('WIRE') || n.includes('SQMM') || n.includes('CABLE'); }
+  function isPipe(item) { const n = (item.name || '').toUpperCase(); return n.includes('PIPE') || n.includes('CONDUIT') || n.includes('TUBE') || n.includes('PVC') || n.includes('CPVC') || n.includes('UPVC'); }
+  function isPurePipe(item) { const n = item.name.toUpperCase(); return isPipe(item) && !n.includes('BEND') && !n.includes('FLEXIBLE'); }
+  function baseName(name) {
+    let n = name.toUpperCase();
+    WIRE_COLORS.forEach(c => { n = n.replace(new RegExp('\\s+' + c + '$'), '').trim(); });
+    return n;
+  }
+  function getPipeSize(name) { const n = (name || '').toUpperCase(); return PIPE_SIZES.find(s => n.includes(s)) || null; }
+
+  function addItem({ name, category = '', brand = '', unit = 'Nos', cost_price = 0, sell_price = 0, hsn = '', min_stock = 0 }) {
     if (!name || !name.trim()) throw new Error('Item name is required');
     const item = {
       id: uid('item'), name: name.trim(), category, brand, unit,
       cost_price: Number(cost_price) || 0, sell_price: Number(sell_price) || 0,
-      hsn, stock_qty: 0, low_stock_threshold: Number(low_stock_threshold) || 0
+      hsn, stock_qty: 0, min_stock: Number(min_stock) || 0
     };
     db.items.push(item);
     persist();
@@ -499,7 +531,10 @@ const Core = (() => {
   }
 
   function lowStockItems() {
-    return db.items.filter(i => i.low_stock_threshold > 0 && i.stock_qty <= i.low_stock_threshold);
+    return db.items.filter(i => i.min_stock > 0 && i.stock_qty <= i.min_stock);
+  }
+  function itemBrands() {
+    return Array.from(new Set(db.items.map(i => i.brand || 'Unknown Brand'))).sort();
   }
 
   /* ---------- INDENTS (what a client wants, before pricing) ---------- */
@@ -678,6 +713,7 @@ const Core = (() => {
           mergeTable(table, remote);
         }
         this.lastError = null;
+        migrateItems(db);
         localStorage.setItem(DB_KEY, JSON.stringify(db));
         document.dispatchEvent(new CustomEvent('core:change'));
       } catch (e) { this.lastError = e.message; }
@@ -713,6 +749,7 @@ const Core = (() => {
     getDiaryStops, addDiaryStop, deleteDiaryStop, diaryDates,
     // items
     addItem, getItem, listItems, updateItemPrice,
+    WIRE_COLORS, PIPE_SIZES, CS_BG, CS_TX, isWire, isPipe, isPurePipe, baseName, getPipeSize, itemBrands,
     // stock
     stockMove, lowStockItems,
     // indents
@@ -741,21 +778,28 @@ const Leads = (() => {
   let statusFilter = 'All';
   let catFilter = 'All';
   let urgencyFilter = 'All';
-  let leadsView = 'pipeline';   // 'pipeline' | 'diary'
+  let leadsView = 'pipeline';   // 'pipeline' | 'diary' | 'map' | 'insights'
   let diaryDate = null;
+  let mapDate = null;
+  let insightDays = 30;
+  let _map = null, _mapLayer = null;
 
   function todayStr() { return new Date().toISOString().slice(0, 10); }
 
   function render() {
     if (leadsView === 'diary') { renderDiary(); return; }
+    if (leadsView === 'map') { renderMap(); return; }
+    if (leadsView === 'insights') { renderInsightsView(); return; }
     renderPipeline();
   }
 
   function tabsHtml() {
     return `
-      <div style="display:flex; gap:6px; margin-bottom:16px;">
+      <div style="display:flex; gap:6px; margin-bottom:16px; flex-wrap:wrap;">
         <button class="btn ${leadsView === 'pipeline' ? '' : 'ghost'} sm view-tab" data-view="pipeline">Leads Pipeline</button>
         <button class="btn ${leadsView === 'diary' ? '' : 'ghost'} sm view-tab" data-view="diary">📓 Diary</button>
+        <button class="btn ${leadsView === 'map' ? '' : 'ghost'} sm view-tab" data-view="map">🗺️ Map</button>
+        <button class="btn ${leadsView === 'insights' ? '' : 'ghost'} sm view-tab" data-view="insights">📊 Insights</button>
       </div>
     `;
   }
@@ -1130,15 +1174,26 @@ const Leads = (() => {
   }
 
   function openCallForm(party_id) {
+    _locData = {};
     showModal('Log a Call', `
       <div class="field"><label>Outcome</label>
         <select id="cf-outcome">${Core.CALL_OUTCOMES.map(o => `<option>${o}</option>`).join('')}</select>
       </div>
       <div class="field"><label>Notes</label><textarea id="cf-notes" rows="2" placeholder="What was discussed"></textarea></div>
+      <div class="field">
+        <label>Location (optional)</label>
+        <button class="btn ghost sm" id="cf-gps-btn" type="button">📍 Capture GPS Location</button>
+        <div id="cf-loc-display" class="hint"></div>
+      </div>
       <button class="btn amber" id="save-call" style="width:100%; justify-content:center;">Save Call</button>
     `);
+    document.getElementById('cf-gps-btn').onclick = () => getLocation(document.getElementById('cf-gps-btn'), document.getElementById('cf-loc-display'));
     document.getElementById('save-call').onclick = () => {
-      Core.addCall(party_id, { outcome: document.getElementById('cf-outcome').value, notes: document.getElementById('cf-notes').value.trim() });
+      Core.addCall(party_id, {
+        outcome: document.getElementById('cf-outcome').value,
+        notes: document.getElementById('cf-notes').value.trim(),
+        lat: _locData.lat || '', lng: _locData.lng || ''
+      });
       closeModal(); toast('Call logged'); openPartyDetail(party_id);
     };
   }
@@ -1326,47 +1381,383 @@ const Leads = (() => {
     };
   }
 
-  return { render };
+  /* ---------- MAP: plots the day's diary stops, calls, and lead updates ---------- */
+
+  function renderMap() {
+    const main = document.getElementById('main');
+    if (!mapDate) mapDate = todayStr();
+
+    main.innerHTML = `
+      <div class="page-head">
+        <div>
+          <div class="page-title">Map</div>
+          <div class="page-desc">Everywhere location was captured on a given day — diary stops, calls, and lead updates.</div>
+        </div>
+      </div>
+      ${tabsHtml()}
+      <div style="margin-bottom:12px;">
+        <input type="date" id="map-date-picker" value="${mapDate}" max="${todayStr()}" style="width:auto;">
+      </div>
+      <div class="card" style="padding:0; overflow:hidden;">
+        <div id="leads-map" style="height:380px; width:100%;"></div>
+      </div>
+      <div class="card">
+        <div class="card-title" id="map-summary">Loading…</div>
+        <div id="map-list"></div>
+      </div>
+    `;
+
+    document.querySelectorAll('.view-tab').forEach(b => b.onclick = () => { leadsView = b.dataset.view; render(); });
+    document.getElementById('map-date-picker').onchange = (e) => { mapDate = e.target.value; renderMap(); };
+
+    if (!window.L) { document.getElementById('map-summary').textContent = 'Map library failed to load (needs internet on first load).'; return; }
+
+    if (!_map) {
+      _map = L.map('leads-map', { zoomControl: true, attributionControl: false }).setView([20.59, 78.96], 5);
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(_map);
+    }
+    setTimeout(() => _map.invalidateSize(), 150);
+    if (_mapLayer) _map.removeLayer(_mapLayer);
+    _mapLayer = L.layerGroup().addTo(_map);
+
+    const events = [];
+    Core.getDiaryStops(mapDate).filter(s => s.lat && s.lng).forEach(s =>
+      events.push({ type: 'stop', ts: s.ts, lat: +s.lat, lng: +s.lng, address: s.address || '', label: s.label, sub: s.type.toUpperCase() }));
+    Core._db().calls.filter(c => (c.date || '').slice(0, 10) === mapDate && c.lat && c.lng).forEach(c => {
+      const party = Core.getParty(c.party_id);
+      events.push({ type: 'call', ts: c.date, lat: +c.lat, lng: +c.lng, address: '', label: party ? (party.company || party.name) : 'Call', sub: c.outcome });
+    });
+    Core.listParties({}).filter(p => p.lat && p.lng && (p.updated_at || '').slice(0, 10) === mapDate).forEach(p =>
+      events.push({ type: 'lead', ts: p.updated_at, lat: +p.lat, lng: +p.lng, address: p.address || '', label: p.company || p.name, sub: p.status }));
+    events.sort((a, b) => a.ts.localeCompare(b.ts));
+
+    const icons = { stop: ['📍', '#e8a53d'], call: ['📞', '#3f7d5c'], lead: ['👤', '#1e3f66'] };
+    const lls = [];
+    events.forEach((ev) => {
+      lls.push([ev.lat, ev.lng]);
+      const [emoji, color] = icons[ev.type];
+      const icon = L.divIcon({
+        html: `<div style="width:34px;height:34px;border-radius:50%;background:${color};border:3px solid #fff;display:flex;align-items:center;justify-content:center;font-size:15px;box-shadow:0 3px 10px rgba(0,0,0,.35);">${emoji}</div>`,
+        iconSize: [34, 34], iconAnchor: [17, 17], className: ''
+      });
+      L.marker([ev.lat, ev.lng], { icon }).bindPopup(`<b>${esc(ev.label)}</b><br>${esc(ev.sub || '')}<br><span style="color:#888;">${ev.address ? esc(ev.address) + '<br>' : ''}${fmtDate(ev.ts)}</span>`).addTo(_mapLayer);
+    });
+    if (lls.length > 1) L.polyline(lls, { color: '#c98a26', weight: 3, opacity: 0.8, dashArray: '7,9' }).addTo(_mapLayer);
+    if (lls.length === 1) _map.setView(lls[0], 15);
+    else if (lls.length > 1) _map.fitBounds(lls, { padding: [40, 40] });
+
+    document.getElementById('map-summary').textContent = `${events.length} location${events.length === 1 ? '' : 's'} on ${fmtDate(mapDate)}`;
+    const listEl = document.getElementById('map-list');
+    if (!events.length) { listEl.innerHTML = `<div class="empty">No location data for this date. Add a diary stop, or log a call with GPS.</div>`; return; }
+    listEl.innerHTML = events.map(ev => `
+      <div style="display:flex; gap:10px; padding:10px 0; border-bottom:1px solid var(--paper-dim);">
+        <div style="font-size:18px;">${icons[ev.type][0]}</div>
+        <div style="flex:1;">
+          <b>${esc(ev.label)}</b> <span class="badge new" style="text-transform:capitalize;">${ev.type}</span>
+          <div class="hint">${esc(ev.sub || '')}${ev.address ? ' · ' + esc(ev.address) : ''} · ${fmtDate(ev.ts)}</div>
+        </div>
+        <button class="btn sm ghost" onclick="window.open('https://www.google.com/maps/dir/?api=1&destination=${ev.lat},${ev.lng}&travelmode=driving','_blank')">Navigate</button>
+      </div>
+    `).join('');
+  }
+
+  /* ---------- INSIGHTS: date-range analytics on the lead pipeline ---------- */
+
+  function renderInsightsView() {
+    const main = document.getElementById('main');
+    const allLeads = Core.listParties({ type: 'lead' }).concat(Core.listParties({ type: 'customer' }));
+    const now = new Date();
+    const inRange = (l, days) => {
+      if (days === 0) return true;
+      if (!l.created_at) return false;
+      return (now - new Date(l.created_at)) / 86400000 <= days;
+    };
+    const filtered = allLeads.filter(l => inRange(l, insightDays));
+    const rangeLabel = insightDays === 7 ? 'Last 7 Days' : insightDays === 30 ? 'Last 30 Days' : 'All Time';
+
+    const last7 = allLeads.filter(l => inRange(l, 7)).length;
+    const last30 = allLeads.filter(l => inRange(l, 30)).length;
+    const last7prev = allLeads.filter(l => l.created_at && (now - new Date(l.created_at)) / 86400000 > 7 && (now - new Date(l.created_at)) / 86400000 <= 14).length;
+    const trend = last7 > last7prev ? '↑' : last7 < last7prev ? '↓' : '→';
+
+    const catCounts = {}; Core.CATEGORIES.forEach(c => catCounts[c.key] = allLeads.filter(l => l.category === c.key).length);
+    const noCat = allLeads.filter(l => !l.category).length;
+    const catTotal = allLeads.length || 1;
+
+    const activeSt = Core.PARTY_STATUS.filter(s => s !== 'Closed' && s !== 'Lost');
+    const stCounts = {}; activeSt.forEach(s => stCounts[s] = filtered.filter(l => l.status === s).length);
+    const stTotal = Math.max(...Object.values(stCounts), 1);
+
+    const newSite = filtered.filter(l => l.leadType === 'New Site' || !l.leadType).length;
+    const existing = filtered.filter(l => l.leadType === 'Existing Client').length;
+    const recent = [...filtered].sort((a, b) => (b.created_at || '').localeCompare(a.created_at || '')).slice(0, 5);
+
+    main.innerHTML = `
+      <div class="page-head">
+        <div>
+          <div class="page-title">Insights</div>
+          <div class="page-desc">How the pipeline is moving — where leads are concentrated and where they're headed.</div>
+        </div>
+      </div>
+      ${tabsHtml()}
+      <div style="display:flex; gap:6px; margin-bottom:16px;">
+        ${rangeBtn(7, '7 Days')} ${rangeBtn(30, '30 Days')} ${rangeBtn(0, 'All Time')}
+      </div>
+
+      <div class="stat-row">
+        <div class="stat"><div class="stat-num">${filtered.length}</div><div class="stat-label">${rangeLabel}</div></div>
+        <div class="stat"><div class="stat-num">${last7} <span style="font-size:14px;">${trend}</span></div><div class="stat-label">This Week</div></div>
+        <div class="stat"><div class="stat-num">${last30}</div><div class="stat-label">This Month</div></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">🏗️ Construction Stage Concentration <span style="font-weight:400; text-transform:none; color:var(--ink-dim);">(all ${allLeads.length} leads)</span></div>
+        ${Core.CATEGORIES.map(c => barRow(`${c.icon} ${c.label}`, catCounts[c.key], catTotal)).join('')}
+        ${noCat > 0 ? barRow('❓ Not Set', noCat, catTotal) : ''}
+      </div>
+
+      <div class="card">
+        <div class="card-title">Pipeline Stage Breakdown <span style="font-weight:400; text-transform:none; color:var(--ink-dim);">(${rangeLabel})</span></div>
+        ${activeSt.map(s => barRow(statusLabel(s), stCounts[s], stTotal)).join('')}
+      </div>
+
+      <div class="card">
+        <div class="card-title">Lead Type <span style="font-weight:400; text-transform:none; color:var(--ink-dim);">(${rangeLabel})</span></div>
+        ${barRow('🆕 New Site', newSite, filtered.length || 1)}
+        ${barRow('🔄 Existing Client', existing, filtered.length || 1)}
+      </div>
+
+      <div class="card">
+        <div class="card-title">Recently Added</div>
+        ${recent.length ? recent.map(l => `
+          <div style="padding:8px 0; border-bottom:1px solid var(--paper-dim); font-size:13px; display:flex; justify-content:space-between;">
+            <span><b>${esc(l.company || l.name)}</b> <span class="badge ${(l.status || 'new').toLowerCase()}">${esc(l.status)}</span></span>
+            <span class="hint">${fmtDate(l.created_at)}</span>
+          </div>
+        `).join('') : `<div class="empty">No leads in this range.</div>`}
+      </div>
+    `;
+    document.querySelectorAll('.view-tab').forEach(b => b.onclick = () => { leadsView = b.dataset.view; render(); });
+    document.querySelectorAll('.range-btn').forEach(b => b.onclick = () => { insightDays = Number(b.dataset.days); render(); });
+  }
+
+  function rangeBtn(days, label) {
+    return `<button class="btn ${insightDays === days ? '' : 'ghost'} sm range-btn" data-days="${days}">${label}</button>`;
+  }
+  function barRow(label, count, total) {
+    const pct = Math.round((count / (total || 1)) * 100);
+    return `
+      <div style="margin-bottom:10px;">
+        <div style="display:flex; justify-content:space-between; font-size:12.5px; margin-bottom:3px;">
+          <span>${label}</span><span style="color:var(--ink-dim);">${count} (${pct}%)</span>
+        </div>
+        <div style="height:6px; background:var(--paper-dim); border-radius:3px; overflow:hidden;">
+          <div style="height:100%; width:${pct}%; background:var(--amber);"></div>
+        </div>
+      </div>
+    `;
+  }
+
+  return { render, openLeadForm, openCallForm };
 })();
 
 /* ===== inventory.js ===== */
 /* =========================================================================
-   INVENTORY module
-   Pipeline stage 2: Item master + pricing that Quotation reads from,
-   and the stock ledger that Quotation confirms write into.
+   INVENTORY module — Phase 1
+   Item master, pricing, and stock. Quotation reads prices from here;
+   confirmed sales deduct stock here. Closing-stock view groups items by
+   brand and renders the wire colour matrix / pipe size matrix exactly like
+   the original standalone Godown Inventory app.
+   Still to come (Phase 2+): damage tracking, transfers, full ledgers, reports.
    ========================================================================= */
 
 const Inventory = (() => {
 
+  let view = 'stock';      // 'stock' | 'master'
+  let brandFilter = '';
+
   function render() {
+    if (view === 'master') { renderMaster(); return; }
+    renderClosingStock();
+  }
+
+  function tabsHtml() {
+    return `
+      <div style="display:flex; gap:6px; margin-bottom:16px;">
+        <button class="btn ${view === 'stock' ? '' : 'ghost'} sm view-tab" data-view="stock">📊 Closing Stock</button>
+        <button class="btn ${view === 'master' ? '' : 'ghost'} sm view-tab" data-view="master">🗂 Item Master</button>
+      </div>
+    `;
+  }
+
+  /* ---------- CLOSING STOCK: brand-grouped, wire/pipe matrix ---------- */
+
+  function renderClosingStock() {
     const main = document.getElementById('main');
-    const items = Core.listItems();
+    const brands = Core.itemBrands();
     const low = Core.lowStockItems();
 
     main.innerHTML = `
       <div class="page-head">
         <div>
           <div class="page-title">Inventory</div>
-          <div class="page-desc">Item master, pricing, and stock. Quotation reads prices from here; confirmed sales deduct stock here.</div>
+          <div class="page-desc">Closing stock by brand — wire colours and pipe sizes laid out the way the godown actually thinks about them.</div>
         </div>
         <button class="btn amber" id="btn-add-item">+ Add Item</button>
       </div>
 
+      ${tabsHtml()}
+
       <div class="stat-row">
-        <div class="stat"><div class="stat-num">${items.length}</div><div class="stat-label">Items</div></div>
-        <div class="stat"><div class="stat-num">${items.reduce((s, i) => s + i.stock_qty, 0)}</div><div class="stat-label">Total Stock Units</div></div>
+        <div class="stat"><div class="stat-num">${Core.listItems().length}</div><div class="stat-label">Items</div></div>
+        <div class="stat"><div class="stat-num">${brands.length}</div><div class="stat-label">Brands</div></div>
         <div class="stat"><div class="stat-num" style="color:${low.length ? 'var(--red)' : 'inherit'}">${low.length}</div><div class="stat-label">Low Stock Alerts</div></div>
       </div>
 
       ${low.length ? `
         <div class="card" style="border-color:#e6c9c5;">
-          <div class="card-title" style="color:var(--red);">Low Stock</div>
-          ${low.map(i => `<div style="font-size:13px; padding:4px 0;"><b>${esc(i.name)}</b> — ${i.stock_qty} ${esc(i.unit)} left (threshold ${i.low_stock_threshold})</div>`).join('')}
+          <div class="card-title" style="color:var(--red);">⚠ Low Stock</div>
+          ${low.map(i => `<div style="font-size:13px; padding:4px 0;"><b>${esc(i.name)}</b> ${i.brand ? '(' + esc(i.brand) + ')' : ''} — ${i.stock_qty} ${esc(i.unit)} left (min ${i.min_stock})</div>`).join('')}
         </div>
       ` : ''}
 
+      <div class="card" style="padding-bottom:10px;">
+        <label>Select Brand</label>
+        <select id="cs-brand">
+          <option value="">— Choose a brand —</option>
+          ${brands.map(b => `<option value="${esc(b)}" ${b === brandFilter ? 'selected' : ''}>${esc(b)}</option>`).join('')}
+        </select>
+      </div>
+
+      <div id="cs-results"></div>
+    `;
+
+    document.getElementById('btn-add-item').onclick = openAddItemModal;
+    document.querySelectorAll('.view-tab').forEach(b => b.onclick = () => { view = b.dataset.view; render(); });
+    document.getElementById('cs-brand').onchange = (e) => { brandFilter = e.target.value; renderBrandStock(); };
+    if (brandFilter) renderBrandStock();
+  }
+
+  function renderBrandStock() {
+    const el = document.getElementById('cs-results');
+    if (!brandFilter) { el.innerHTML = ''; return; }
+    const items = Core.listItems().filter(i => (i.brand || 'Unknown Brand') === brandFilter);
+    if (!items.length) { el.innerHTML = `<div class="empty">No items for this brand.</div>`; return; }
+
+    const wireItems = items.filter(Core.isWire);
+    const pipeItems = items.filter(i => Core.isPurePipe(i));
+    const otherItems = items.filter(i => !Core.isWire(i) && !Core.isPipe(i));
+
+    let html = `<div class="card" style="padding:0; overflow:hidden;">`;
+    if (wireItems.length) html += wireMatrixHtml(wireItems);
+    if (pipeItems.length) html += pipeMatrixHtml(pipeItems);
+    html += `</div>`;
+
+    if (otherItems.length) {
+      const byCat = {};
+      otherItems.forEach(i => { const c = i.category || 'Other'; (byCat[c] = byCat[c] || []).push(i); });
+      Object.keys(byCat).sort().forEach(cat => {
+        html += `<div class="card" style="padding:0; overflow:hidden; margin-top:12px;">
+          <div style="font-size:13px; font-weight:700; color:var(--navy-700); padding:10px 16px; background:#e8f0fb; border-bottom:1px solid #d0ddf5;">📂 ${esc(cat)}</div>
+          ${plainItemTable(byCat[cat].sort((a, b) => a.name.localeCompare(b.name)))}
+        </div>`;
+      });
+    }
+    el.innerHTML = html;
+    el.querySelectorAll('.stock-in-btn').forEach(b => b.onclick = () => openStockModal(b.dataset.id, 'in'));
+    el.querySelectorAll('.stock-out-btn').forEach(b => b.onclick = () => openStockModal(b.dataset.id, 'out'));
+  }
+
+  function wireMatrixHtml(wireItems) {
+    const usedColors = Core.WIRE_COLORS.filter(c => wireItems.some(i => i.name.toUpperCase().endsWith(' ' + c)));
+    if (!usedColors.length) return '';
+    const rows = {};
+    wireItems.forEach(i => {
+      const color = Core.WIRE_COLORS.find(c => i.name.toUpperCase().endsWith(' ' + c));
+      const base = Core.baseName(i.name);
+      (rows[base] = rows[base] || {})[color || 'OTHER'] = i;
+    });
+    let h = `<div style="font-size:13px; font-weight:700; color:#185FA5; padding:10px 16px; background:#e8f0fb; border-bottom:1px solid #d0ddf5;">🔌 Wires &amp; Cables — Colour Matrix</div>`;
+    h += `<table style="border-collapse:collapse; width:100%; font-size:13px;"><thead><tr>
+      <th style="background:#f8f9fa; padding:9px 12px; border:1px solid #ddd; text-align:left; min-width:180px;">Wire Type</th>
+      ${usedColors.map(c => `<th style="background:${Core.CS_BG[c]}; color:${Core.CS_TX[c]}; padding:9px 14px; border:1px solid #ddd; text-align:center; font-weight:700;">${c}</th>`).join('')}
+    </tr></thead><tbody>`;
+    Object.keys(rows).sort().forEach((base, idx) => {
+      h += `<tr style="background:${idx % 2 === 0 ? '#fff' : '#fafafa'};">
+        <td style="padding:9px 12px; border:1px solid #e0e0e0; font-weight:500;">${esc(base)}</td>
+        ${usedColors.map(c => {
+          const v = rows[base][c];
+          if (!v) return `<td style="padding:9px 14px; border:1px solid #e0e0e0; text-align:center; color:#ccc;">--</td>`;
+          const low = v.stock_qty <= v.min_stock && v.min_stock > 0;
+          return `<td class="wire-cell" data-id="${v.id}" style="padding:9px 14px; border:1px solid #e0e0e0; text-align:center; font-weight:700; cursor:pointer; background:${low ? '#ffebee' : Core.CS_BG[c] + '22'}; color:${low ? '#c62828' : '#1a1a1a'};" title="Click to view/edit stock">${low ? '⚠ ' : ''}${v.stock_qty}</td>`;
+        }).join('')}
+      </tr>`;
+    });
+    h += `</tbody></table>`;
+    return h;
+  }
+
+  function pipeMatrixHtml(pipeItems) {
+    const sorted = pipeItems.sort((a, b) => a.name.localeCompare(b.name));
+    let h = `<div style="font-size:13px; font-weight:700; color:#1b5e20; padding:10px 16px; background:#e8f5e9; border-bottom:1px solid #c8e6c9;">🪠 Pipes</div>`;
+    h += `<table style="border-collapse:collapse; width:100%; font-size:13px;"><thead><tr>
+      <th style="background:#2e7d32; color:#fff; padding:9px 14px; border:1px solid #388e3c; text-align:left;">Pipe Name</th>
+      <th style="background:#2e7d32; color:#fff; padding:9px 14px; border:1px solid #388e3c; text-align:center;">Stock</th>
+      <th style="background:#2e7d32; color:#fff; padding:9px 14px; border:1px solid #388e3c; text-align:center;">Unit</th>
+      <th style="background:#2e7d32; color:#fff; padding:9px 14px; border:1px solid #388e3c; text-align:center;">Status</th>
+    </tr></thead><tbody>`;
+    sorted.forEach((i, idx) => {
+      const low = i.stock_qty <= i.min_stock && i.min_stock > 0;
+      h += `<tr class="wire-cell" data-id="${i.id}" style="cursor:pointer; background:${low ? '#fff8f8' : (idx % 2 === 0 ? '#fff' : '#f1f8e9')};">
+        <td style="padding:10px 14px; border:1px solid #dcedc8; font-weight:600; color:#1b5e20;">${esc(i.name)}</td>
+        <td style="padding:10px 14px; border:1px solid #dcedc8; text-align:center; font-size:16px; font-weight:800; color:${low ? '#c62828' : '#2e7d32'};">${i.stock_qty}</td>
+        <td style="padding:10px 14px; border:1px solid #dcedc8; text-align:center; color:#555; font-size:12px;">${esc(i.unit)}</td>
+        <td style="padding:10px 14px; border:1px solid #dcedc8; text-align:center;"><span class="badge ${low ? 'low' : 'confirmed'}">${low ? '⚠ LOW' : '✓ OK'}</span></td>
+      </tr>`;
+    });
+    h += `</tbody></table>`;
+    return h;
+  }
+
+  function plainItemTable(items) {
+    let h = `<table style="border-collapse:collapse; width:100%; font-size:13px;"><thead><tr>
+      <th style="padding:9px 14px; border-bottom:2px solid #e0e0e0; text-align:left;">Item Name</th>
+      <th style="padding:9px 14px; border-bottom:2px solid #e0e0e0; text-align:center;">Stock</th>
+      <th style="padding:9px 14px; border-bottom:2px solid #e0e0e0; text-align:center;">Unit</th>
+      <th style="padding:9px 14px; border-bottom:2px solid #e0e0e0; text-align:center;">Status</th>
+    </tr></thead><tbody>`;
+    items.forEach((i, idx) => {
+      const low = i.stock_qty <= i.min_stock && i.min_stock > 0;
+      h += `<tr class="wire-cell" data-id="${i.id}" style="cursor:pointer; background:${idx % 2 === 0 ? '#fff' : '#fafafa'};">
+        <td style="padding:9px 14px; border-bottom:1px solid #f0f0f0; font-weight:500;">${esc(i.name)}</td>
+        <td style="padding:9px 14px; border-bottom:1px solid #f0f0f0; text-align:center; font-weight:700;">${i.stock_qty}</td>
+        <td style="padding:9px 14px; border-bottom:1px solid #f0f0f0; text-align:center; color:#555;">${esc(i.unit)}</td>
+        <td style="padding:9px 14px; border-bottom:1px solid #f0f0f0; text-align:center;"><span class="badge ${low ? 'low' : 'confirmed'}">${low ? '⚠ Low' : '✓ OK'}</span></td>
+      </tr>`;
+    });
+    h += `</tbody></table>`;
+    return h;
+  }
+
+  /* ---------- ITEM MASTER: full list + add/stock in/out ---------- */
+
+  function renderMaster() {
+    const main = document.getElementById('main');
+    const items = Core.listItems();
+
+    main.innerHTML = `
+      <div class="page-head">
+        <div>
+          <div class="page-title">Inventory</div>
+          <div class="page-desc">Full item list. Quotation reads prices from here; confirmed sales deduct stock here.</div>
+        </div>
+        <button class="btn amber" id="btn-add-item">+ Add Item</button>
+      </div>
+
+      ${tabsHtml()}
+
       <div class="card">
-        <div class="card-title">Item Master</div>
+        <div class="card-title">Item Master (${items.length})</div>
         ${items.length ? `
           <table>
             <thead><tr><th>Item</th><th>Brand</th><th>Cost</th><th>Sell</th><th>Stock</th><th></th></tr></thead>
@@ -1377,7 +1768,7 @@ const Inventory = (() => {
                   <td>${esc(i.brand) || '—'}</td>
                   <td>₹${i.cost_price}</td>
                   <td>₹${i.sell_price}</td>
-                  <td>${i.stock_qty <= i.low_stock_threshold && i.low_stock_threshold > 0 ? `<span class="badge low">${i.stock_qty} ${esc(i.unit)}</span>` : `${i.stock_qty} ${esc(i.unit)}`}</td>
+                  <td>${i.stock_qty <= i.min_stock && i.min_stock > 0 ? `<span class="badge low">${i.stock_qty} ${esc(i.unit)}</span>` : `${i.stock_qty} ${esc(i.unit)}`}</td>
                   <td style="text-align:right;">
                     <button class="btn sm ghost stock-in-btn" data-id="${i.id}">Stock In</button>
                     <button class="btn sm ghost stock-out-btn" data-id="${i.id}">Stock Out</button>
@@ -1391,22 +1782,26 @@ const Inventory = (() => {
     `;
 
     document.getElementById('btn-add-item').onclick = openAddItemModal;
+    document.querySelectorAll('.view-tab').forEach(b => b.onclick = () => { view = b.dataset.view; render(); });
     document.querySelectorAll('.stock-in-btn').forEach(b => b.onclick = () => openStockModal(b.dataset.id, 'in'));
     document.querySelectorAll('.stock-out-btn').forEach(b => b.onclick = () => openStockModal(b.dataset.id, 'out'));
   }
 
+  /* ---------- shared: add item + stock in/out modals ---------- */
+
   function openAddItemModal() {
     showModal('Add Item', `
-      <div class="field"><label>Item Name *</label><input id="f-name" placeholder="e.g. 2.5 sq mm Copper Wire"></div>
+      <div class="field"><label>Item Name *</label><input id="f-name" placeholder="e.g. 2.5 SQMM WIRE RED, or 20MM PVC PIPE"></div>
+      <div class="hint" style="margin-bottom:10px;">Tip: end wire names with a colour (RED/YELLOW/GREEN/BLUE/BLACK/WHITE/GREY) and pipe names with a size (20MM, 25MM...) to get the matrix view automatically.</div>
       <div class="field-row">
         <div class="field"><label>Category</label><input id="f-cat" placeholder="Wire / Switch / Light..."></div>
-        <div class="field"><label>Brand</label><input id="f-brand" placeholder="Optional"></div>
+        <div class="field"><label>Brand *</label><input id="f-brand" placeholder="e.g. Havells, Polycab"></div>
       </div>
       <div class="field-row">
         <div class="field"><label>Unit</label>
           <select id="f-unit"><option>Nos</option><option>Mtr</option><option>Box</option><option>Coil</option><option>Kg</option></select>
         </div>
-        <div class="field"><label>Low Stock Alert At</label><input id="f-threshold" type="number" value="0"></div>
+        <div class="field"><label>Min Stock Level</label><input id="f-threshold" type="number" value="0"></div>
       </div>
       <div class="field-row">
         <div class="field"><label>Cost Price (₹)</label><input id="f-cost" type="number" value="0"></div>
@@ -1425,7 +1820,7 @@ const Inventory = (() => {
         cost_price: document.getElementById('f-cost').value,
         sell_price: document.getElementById('f-sell').value,
         hsn: document.getElementById('f-hsn').value.trim(),
-        low_stock_threshold: document.getElementById('f-threshold').value
+        min_stock: document.getElementById('f-threshold').value
       });
       closeModal(); toast('Item added'); render();
     };
@@ -1445,6 +1840,25 @@ const Inventory = (() => {
       Core.stockMove(item_id, type, qty, { ref_type: type === 'in' ? 'purchase' : 'manual', notes: document.getElementById('f-note').value.trim() });
       closeModal(); toast(`Stock ${type === 'in' ? 'in' : 'out'} recorded`); render();
     };
+  }
+
+  // clicking any matrix cell or table row opens a quick stock in/out picker
+  document.addEventListener('click', (e) => {
+    const cell = e.target.closest('.wire-cell');
+    if (cell) openQuickStockPicker(cell.dataset.id);
+  });
+  function openQuickStockPicker(item_id) {
+    const item = Core.getItem(item_id);
+    if (!item) return;
+    showModal(item.name, `
+      <div class="hint" style="margin-bottom:12px;">Current stock: <b>${item.stock_qty} ${esc(item.unit)}</b> ${item.min_stock ? `(min ${item.min_stock})` : ''}</div>
+      <div style="display:flex; gap:8px;">
+        <button class="btn amber" id="qp-in" style="flex:1; justify-content:center;">Stock In</button>
+        <button class="btn ghost" id="qp-out" style="flex:1; justify-content:center;">Stock Out</button>
+      </div>
+    `);
+    document.getElementById('qp-in').onclick = () => openStockModal(item_id, 'in');
+    document.getElementById('qp-out').onclick = () => openStockModal(item_id, 'out');
   }
 
   return { render };
@@ -1790,6 +2204,13 @@ const App = (() => {
     const pendingConfirm = quotations.filter(q => q.status === 'draft');
     const confirmedValue = quotations.filter(q => q.status === 'confirmed').reduce((s, q) => s + q.total, 0);
 
+    const today = new Date().toISOString().slice(0, 10);
+    const active = parties.filter(p => (p.type === 'lead' || p.type === 'customer') && p.status !== 'Closed' && p.status !== 'Lost');
+    const overdue = active.filter(p => p.nextFollowUp && p.nextFollowUp < today).sort((a, b) => a.nextFollowUp.localeCompare(b.nextFollowUp));
+    const dueToday = active.filter(p => p.nextFollowUp === today);
+    const upcoming = active.filter(p => p.nextFollowUp && p.nextFollowUp > today).sort((a, b) => a.nextFollowUp.localeCompare(b.nextFollowUp)).slice(0, 5);
+    const urgentCount = overdue.length + dueToday.length;
+
     main.innerHTML = `
       <div class="page-head">
         <div>
@@ -1803,6 +2224,14 @@ const App = (() => {
         <div class="stat"><div class="stat-num">${items.length}</div><div class="stat-label">Items Tracked</div></div>
         <div class="stat"><div class="stat-num">${pendingConfirm.length}</div><div class="stat-label">Awaiting Confirmation</div></div>
         <div class="stat"><div class="stat-num">₹${confirmedValue}</div><div class="stat-label">Confirmed Sales Value</div></div>
+      </div>
+
+      <div class="card" style="${urgentCount ? 'border-color:#e6c9c5;' : ''}">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+          <div class="card-title" style="margin-bottom:0;">🔔 Follow-ups Due</div>
+          ${urgentCount ? `<span class="badge lost">${urgentCount} urgent</span>` : `<span style="font-size:12px; color:var(--green);">✅ All clear</span>`}
+        </div>
+        <div id="reminders-list">${remindersHtml(overdue, dueToday, upcoming)}</div>
       </div>
 
       <div class="card">
@@ -1829,6 +2258,51 @@ const App = (() => {
           <div class="empty">Nothing here yet. <b>Start in Leads & Clients</b> to add your first lead, or <b>Inventory</b> to add items.</div>
         </div>
       ` : ''}
+    `;
+
+    document.querySelectorAll('.rm-call-btn').forEach(b => b.onclick = () => Leads.openCallForm(b.dataset.id));
+    document.querySelectorAll('.rm-edit-btn').forEach(b => b.onclick = () => Leads.openLeadForm(b.dataset.id));
+    document.querySelectorAll('.rm-nav-btn').forEach(b => b.onclick = () =>
+      window.open(`https://www.google.com/maps/dir/?api=1&destination=${b.dataset.lat},${b.dataset.lng}&travelmode=driving`, '_blank'));
+  }
+
+  function remindersHtml(overdue, dueToday, upcoming) {
+    if (!overdue.length && !dueToday.length && !upcoming.length) {
+      return `<div class="empty">No active leads with follow-ups. <b>Set a follow-up date</b> from a lead's Edit screen to see it here.</div>`;
+    }
+    let html = '';
+    if (overdue.length) html += sectionLabel('🔴 Overdue', overdue.length) + overdue.map(p => reminderCard(p, 'overdue')).join('');
+    if (dueToday.length) html += sectionLabel('🟡 Due Today', dueToday.length) + dueToday.map(p => reminderCard(p, 'today')).join('');
+    if (upcoming.length) html += sectionLabel('🔵 Upcoming', upcoming.length) + upcoming.map(p => reminderCard(p, 'upcoming')).join('');
+    return html;
+  }
+  function sectionLabel(label, count) {
+    return `<div style="font-size:11px; text-transform:uppercase; letter-spacing:.04em; color:var(--ink-dim); margin:14px 0 6px;">${label} (${count})</div>`;
+  }
+  function reminderCard(p, kind) {
+    const today = new Date().toISOString().slice(0, 10);
+    const daysAgo = Math.round((new Date(today) - new Date(p.nextFollowUp)) / 86400000);
+    const daysLeft = Math.round((new Date(p.nextFollowUp) - new Date(today)) / 86400000);
+    const dueTxt = kind === 'overdue' ? (daysAgo === 1 ? '1 day overdue' : `${daysAgo} days overdue`)
+      : kind === 'today' ? 'Follow up today' : (daysLeft === 1 ? 'Tomorrow' : `In ${daysLeft} days · ${fmtDate(p.nextFollowUp)}`);
+    return `
+      <div style="padding:10px 0; border-bottom:1px solid var(--paper-dim);">
+        <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:8px;">
+          <div>
+            <b>${esc(p.company || p.name)}</b>
+            <div style="font-size:11px; color:var(--ink-dim); margin-top:2px;">
+              <span class="badge ${(p.status || 'new').toLowerCase()}">${esc(p.status)}</span>
+              ${p.phone ? ' 📱 ' + esc(p.phone) : ''}
+            </div>
+          </div>
+          <span class="tag ${kind === 'overdue' ? 'urg-overdue' : kind === 'today' ? 'urg-today' : 'urg-upcoming'}">${dueTxt}</span>
+        </div>
+        <div style="display:flex; gap:6px; margin-top:8px;">
+          <button class="btn sm ghost rm-call-btn" data-id="${p.id}">📞 Log Call</button>
+          ${p.lat && p.lng ? `<button class="btn sm ghost rm-nav-btn" data-lat="${p.lat}" data-lng="${p.lng}">🧭 Navigate</button>` : ''}
+          <button class="btn sm ghost rm-edit-btn" data-id="${p.id}">✏️ Edit</button>
+        </div>
+      </div>
     `;
   }
 

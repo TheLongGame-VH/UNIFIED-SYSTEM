@@ -907,7 +907,7 @@ const Leads = (() => {
       el.classList.add('on');
       document.getElementById('lf-status').value = el.dataset.stage;
     });
-    document.getElementById('lf-gps-btn').onclick = captureLoc;
+    document.getElementById('lf-gps-btn').onclick = () => getLocation(document.getElementById('lf-gps-btn'), document.getElementById('lf-loc-display'));
 
     document.getElementById('save-lead').onclick = () => saveLead(id);
     const delBtn = document.getElementById('del-lead');
@@ -917,19 +917,92 @@ const Leads = (() => {
     };
   }
 
-  function captureLoc() {
-    const btn = document.getElementById('lf-gps-btn');
-    const disp = document.getElementById('lf-loc-display');
+  /** Matches the original standalone app's GPS logic exactly:
+   *  - watches position instead of a single one-shot reading
+   *  - discards first reading if it's a wild cell-tower guess (>500m)
+   *  - needs at least 3 readings before trusting any of them
+   *  - locks in early on ≤20m accuracy, else best of up to 15 readings
+   *  - 40s hard timeout, then falls back to best reading so far
+   *  - reverse-geocodes the final coordinates into a readable address */
+  function getLocation(btn, disp) {
     if (!navigator.geolocation) { disp.textContent = 'GPS not available on this device/browser.'; return; }
-    btn.textContent = '📡 Getting location…';
-    navigator.geolocation.getCurrentPosition(
+    btn.textContent = '📡 Searching satellites…';
+    btn.disabled = true;
+
+    const readings = [];
+    let watchId = null, settled = false;
+
+    function finish(best) {
+      if (settled) return;
+      settled = true;
+      if (watchId !== null) navigator.geolocation.clearWatch(watchId);
+      clearTimeout(timer);
+      const { latitude: lat, longitude: lng, accuracy } = best;
+      const accText = accuracy < 15 ? '🎯 Precise' : accuracy < 40 ? '✅ Good' : accuracy < 100 ? '⚠️ Fair' : '📶 Coarse';
+      btn.disabled = false;
+      btn.textContent = `${accText} ±${Math.round(accuracy)}m — Recapture`;
+
+      _locData = { lat: lat.toFixed(6), lng: lng.toFixed(6) };
+      disp.textContent = `Locating address…`;
+
+      fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}&zoom=18&addressdetails=1`,
+        { headers: { 'Accept-Language': 'en' } })
+        .then(r => r.json())
+        .then(data => {
+          let shortAddr = `${lat.toFixed(6)}, ${lng.toFixed(6)}`;
+          if (data && data.address) {
+            const a = data.address;
+            const parts = [
+              a.building || a.amenity || a.shop || a.office,
+              a.house_number ? (a.road || '') + ' ' + a.house_number : (a.road || a.pedestrian || a.footway || a.path),
+              a.suburb || a.neighbourhood || a.quarter || a.residential,
+              a.city || a.town || a.village || a.county, a.state
+            ].map(s => (s || '').trim()).filter(Boolean);
+            shortAddr = parts.join(', ') || (data.display_name || '').split(',').slice(0, 4).join(',').trim();
+          }
+          disp.innerHTML = `📍 <b>${esc(shortAddr)}</b><br><span style="color:var(--ink-dim);">±${Math.round(accuracy)}m accuracy</span>`;
+          const addrField = document.getElementById('lf-address');
+          if (addrField && !addrField.value.trim()) addrField.value = shortAddr;
+        })
+        .catch(() => { disp.innerHTML = `📍 ${lat.toFixed(6)}, ${lng.toFixed(6)}<br><span style="color:var(--ink-dim);">±${Math.round(accuracy)}m accuracy (offline — coords only)</span>`; });
+    }
+
+    const timer = setTimeout(() => {
+      if (settled) return;
+      if (readings.length > 0) finish(readings.reduce((b, r) => r.accuracy < b.accuracy ? r : b));
+      else {
+        if (watchId !== null) navigator.geolocation.clearWatch(watchId);
+        settled = true; btn.disabled = false; btn.textContent = '📍 Try Again';
+        disp.textContent = 'GPS timeout. Step outside, keep phone still and retry.';
+      }
+    }, 40000);
+
+    watchId = navigator.geolocation.watchPosition(
       (pos) => {
-        _locData = { lat: pos.coords.latitude.toFixed(6), lng: pos.coords.longitude.toFixed(6) };
-        disp.textContent = `Captured: ${_locData.lat}, ${_locData.lng}`;
-        btn.textContent = '📍 Recapture Location';
+        if (settled) return;
+        const c = pos.coords;
+        if (readings.length === 0 && c.accuracy > 500) {
+          btn.textContent = `📡 Weak signal (±${Math.round(c.accuracy)}m) — waiting for GPS…`;
+          return;
+        }
+        readings.push(c);
+        const count = readings.length;
+        const a = Math.round(c.accuracy);
+        btn.textContent = `📡 ±${a}m ${count >= 3 ? '— locking…' : '— warming up…'}`;
+        if (count < 3) return;
+        if (c.accuracy <= 20) { finish(c); return; }
+        if (count >= 15) finish(readings.reduce((b, r) => r.accuracy < b.accuracy ? r : b));
       },
-      (err) => { disp.textContent = 'Could not get location: ' + err.message; btn.textContent = '📍 Capture Current Location'; },
-      { enableHighAccuracy: true, timeout: 12000 }
+      (err) => {
+        if (settled) return;
+        clearTimeout(timer);
+        if (watchId !== null) navigator.geolocation.clearWatch(watchId);
+        settled = true; btn.disabled = false; btn.textContent = '📍 Get GPS';
+        disp.textContent = err.code === 1 ? 'Permission denied. Allow Location in browser settings.'
+          : err.code === 2 ? 'GPS signal not found. Go outside and retry.'
+          : 'GPS timed out. Step outside, keep phone still.';
+      },
+      { enableHighAccuracy: true, timeout: 40000, maximumAge: 0 }
     );
   }
 

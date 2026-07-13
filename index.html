@@ -318,6 +318,7 @@ const Core = (() => {
         delete i.low_stock_threshold;
       }
       if (i.min_stock === undefined) i.min_stock = 0;
+      if (!i.location) i.location = 'GODOWN';
     });
   }
 
@@ -350,14 +351,14 @@ const Core = (() => {
   const CALL_OUTCOMES = ['No Answer', 'Callback Later', 'Not Interested', 'Interested', 'Meeting Fixed', 'Closed Deal'];
 
   function addParty({ name, phone, email = '', address = '', gst = '', type = 'lead', source = 'Cold Call',
-    company = '', leadType = 'New Site', category = '', nextFollowUp = '', lat = '', lng = '', notes = '' }) {
+    company = '', leadType = 'New Site', category = '', nextFollowUp = '', lat = '', lng = '', notes = '', role = '', status = null }) {
     if (!name || !name.trim()) throw new Error('Party name is required');
     const existing = findPartyByNameOrPhone(name, phone);
     if (existing) return existing; // avoid duplicate lead/client records
     const party = {
       id: uid('party'), name: name.trim(), phone: phone || '', email, address, gst,
-      type, status: type === 'lead' ? 'New' : 'Closed', source, company, leadType, category,
-      nextFollowUp, lat, lng, notes,
+      type, status: status || (type === 'lead' ? 'New' : 'Closed'), source, company, leadType, category,
+      nextFollowUp, lat, lng, notes, role,
       created_at: now(), updated_at: now()
     };
     db.parties.push(party);
@@ -493,12 +494,12 @@ const Core = (() => {
   }
   function getPipeSize(name) { const n = (name || '').toUpperCase(); return PIPE_SIZES.find(s => n.includes(s)) || null; }
 
-  function addItem({ name, category = '', brand = '', unit = 'Nos', cost_price = 0, sell_price = 0, hsn = '', min_stock = 0 }) {
+  function addItem({ name, category = '', brand = '', unit = 'Nos', cost_price = 0, sell_price = 0, hsn = '', min_stock = 0, location = 'GODOWN' }) {
     if (!name || !name.trim()) throw new Error('Item name is required');
     const item = {
       id: uid('item'), name: name.trim(), category, brand, unit,
       cost_price: Number(cost_price) || 0, sell_price: Number(sell_price) || 0,
-      hsn, stock_qty: 0, min_stock: Number(min_stock) || 0
+      hsn, stock_qty: 0, min_stock: Number(min_stock) || 0, location
     };
     db.items.push(item);
     persist();
@@ -506,7 +507,10 @@ const Core = (() => {
   }
 
   function getItem(id) { return db.items.find(i => i.id === id) || null; }
-  function listItems() { return db.items.slice().sort((a, b) => a.name.localeCompare(b.name)); }
+  function listItems(filter = {}) {
+    return db.items.filter(i => !filter.location || (i.location || 'GODOWN') === filter.location)
+      .slice().sort((a, b) => a.name.localeCompare(b.name));
+  }
 
   function updateItemPrice(id, { cost_price, sell_price }) {
     const item = getItem(id);
@@ -518,24 +522,207 @@ const Core = (() => {
 
   /* ---------- STOCK LEDGER (Inventory in/out — single source of truth) ---------- */
 
-  function stockMove(item_id, type, qty, { ref_type = 'manual', ref_id = null, party_id = null, notes = '' } = {}) {
+  /** The one path every stock-affecting action goes through. Applies the
+   *  change optimistically (instant UI, same as before), then pushes just
+   *  that ledger row to Supabase and waits for confirmation. If the server
+   *  rejects it (e.g. the negative-stock guard trigger fires because
+   *  another device already used up the stock), the local change is rolled
+   *  back and the caller gets {ok:false, error} to show the user. If the
+   *  device is offline, the optimistic change is kept and synced later —
+   *  full offline conflict resolution isn't attempted. */
+  async function stockMove(item_id, type, qty, opts = {}) {
     const item = getItem(item_id);
     if (!item) throw new Error('Unknown item for stock move');
     qty = Number(qty) || 0;
-    if (qty <= 0) return;
+    if (qty <= 0) return { ok: false, error: 'Invalid quantity' };
+
     item.stock_qty += (type === 'in' ? qty : -qty);
-    db.stock_ledger.push({
-      id: uid('stk'), item_id, type, qty, ref_type, ref_id, party_id, date: now(), notes
-    });
+    const row = {
+      id: uid('stk'), item_id, type, qty,
+      ref_type: opts.ref_type || 'manual', ref_id: opts.ref_id || null,
+      party_id: opts.party_id || null, party_name: opts.party_name || '', operator: opts.operator || '',
+      credit_days: Number(opts.credit_days) || 0, date: opts.date || now(), notes: opts.notes || ''
+    };
+    db.stock_ledger.push(row);
     persist();
+
+    const result = await cloud.pushLedgerRowVerified(row);
+    if (!result.ok) {
+      // server rejected it — roll back the optimistic local change
+      item.stock_qty -= (type === 'in' ? qty : -qty);
+      db.stock_ledger = db.stock_ledger.filter(r => r.id !== row.id);
+      persist();
+    }
+    return result;
+  }
+
+  /** Mirrors the original's autoSaveParty: if the typed name matches an
+   *  existing party, upgrades its role if used as both supplier and
+   *  customer; otherwise creates a lightweight party record so future
+   *  entries autocomplete. Reuses the same shared parties table Leads
+   *  uses — a supplier typed here shows up as a real party everywhere. */
+  function autoSaveParty(name, role) {
+    name = (name || '').trim();
+    if (!name || name === 'INTERNAL TRANSFER') return;
+    const existing = findPartyByNameOrPhone(name, '');
+    if (existing) {
+      if (existing.role !== 'BOTH' && existing.role && existing.role !== role) {
+        existing.role = 'BOTH'; existing.updated_at = now();
+      } else if (!existing.role) {
+        existing.role = role; existing.updated_at = now();
+      }
+      return existing;
+    }
+    const party = {
+      id: uid('party'), name, phone: '', email: '', address: '', gst: '',
+      type: 'supplier', status: 'Closed', role, source: 'Stock Entry',
+      company: '', leadType: '', category: '', nextFollowUp: '', lat: '', lng: '', notes: '',
+      created_at: now(), updated_at: now()
+    };
+    db.parties.push(party);
+    persist();
+    return party;
+  }
+  function ledgerPartyNames() {
+    return db.parties.map(p => p.name).filter(Boolean).sort();
   }
 
   function lowStockItems() {
     return db.items.filter(i => i.min_stock > 0 && i.stock_qty <= i.min_stock);
   }
-  function itemBrands() {
-    return Array.from(new Set(db.items.map(i => i.brand || 'Unknown Brand'))).sort();
+  function itemBrands(location) {
+    const scoped = location ? db.items.filter(i => (i.location || 'GODOWN') === location) : db.items;
+    return Array.from(new Set(scoped.map(i => i.brand || 'Unknown Brand'))).sort();
   }
+
+  /* ---------- DAMAGE / RETURN ----------
+     DAMAGE = stock leaves (item was damaged). RETURN = stock comes back
+     (a damaged item was replaced/returned to supplier and credited back). */
+  async function recordDamageOrReturn(item_id, qty, entryType, { party_name = '', notes = '', date = null } = {}) {
+    const item = getItem(item_id);
+    if (!item) throw new Error('Unknown item');
+    qty = Number(qty) || 0;
+    if (qty <= 0) return { ok: false, error: 'Invalid quantity' };
+    if (entryType === 'DAMAGE' && qty > item.stock_qty) return { ok: false, error: `Not enough stock. Available: ${item.stock_qty}` };
+    const moveType = entryType === 'DAMAGE' ? 'out' : 'in';
+    return stockMove(item_id, moveType, qty, { ref_type: entryType === 'DAMAGE' ? 'damage' : 'return', party_name, notes, date });
+  }
+
+  function listDamageLog(filter = {}) {
+    return db.stock_ledger.filter(l => (l.ref_type === 'damage' || l.ref_type === 'return') &&
+      (!filter.entryType || (filter.entryType === 'DAMAGE' ? l.ref_type === 'damage' : l.ref_type === 'return')))
+      .sort((a, b) => b.date.localeCompare(a.date));
+  }
+
+  /* ---------- TRANSFER: moves stock between GODOWN and OFFICE.
+     Auto-creates a matching item at the destination location if one
+     doesn't already exist there (same name+brand). */
+  async function transferStock(item_id, toLocation, qty, notes = '', date = null) {
+    const item = getItem(item_id);
+    if (!item) throw new Error('Unknown item');
+    qty = Number(qty) || 0;
+    if (qty <= 0) return { ok: false, error: 'Invalid quantity' };
+    if (qty > item.stock_qty) return { ok: false, error: `Not enough stock. Available: ${item.stock_qty}` };
+    const fromLocation = item.location || 'GODOWN';
+    let dest = db.items.find(i => i.name === item.name && (i.brand || '') === (item.brand || '') && (i.location || 'GODOWN') === toLocation);
+    if (!dest) {
+      dest = { id: uid('item'), name: item.name, category: item.category, brand: item.brand, unit: item.unit,
+        cost_price: item.cost_price, sell_price: item.sell_price, hsn: item.hsn, stock_qty: 0,
+        min_stock: item.min_stock, location: toLocation };
+      db.items.push(dest);
+      persist();
+    }
+    const ts = date || now();
+    const outResult = await stockMove(item.id, 'out', qty, { ref_type: 'transfer_out', ref_id: dest.id, party_name: `TRANSFER TO ${toLocation}`, notes, date: ts });
+    if (!outResult.ok) return outResult;
+    const inResult = await stockMove(dest.id, 'in', qty, { ref_type: 'transfer_in', ref_id: item.id, party_name: `TRANSFER FROM ${fromLocation}`, notes, date: ts });
+    if (!inResult.ok) return inResult;
+    return { ok: true, dest };
+  }
+
+  function listTransfers() {
+    return db.stock_ledger.filter(l => l.ref_type === 'transfer_out').sort((a, b) => b.date.localeCompare(a.date));
+  }
+
+  /** Flags entries in a proposed batch that look like accidental re-submits:
+   *  same item, qty, party, and day already logged. Matches the original's
+   *  duplicate-detection warning shown before submit. */
+  function findLikelyDuplicates(batch, moveType, dateStr) {
+    return batch.filter(x => db.stock_ledger.some(l =>
+      l.item_id === x.itemId && l.type === moveType && l.qty === x.qty &&
+      (l.party_name || '') === x.partyName && (l.date || '').slice(0, 10) === dateStr));
+  }
+
+  /* ---------- LEDGER: party transaction history + bill grouping ---------- */
+
+  function partyLedger(partyName, { type = '', from = '', to = '' } = {}) {
+    let list = db.stock_ledger.filter(l => (l.party_name || '') === partyName && (l.ref_type === 'purchase' || l.ref_type === 'sale_manual'));
+    if (type) list = list.filter(l => (type === 'IN' ? l.type === 'in' : l.type === 'out'));
+    if (from) list = list.filter(l => l.date.slice(0, 10) >= from);
+    if (to) list = list.filter(l => l.date.slice(0, 10) <= to);
+    return list.sort((a, b) => b.date.localeCompare(a.date));
+  }
+
+  function calcMaturityDate(txnDate, creditDays) {
+    if (!creditDays) return null;
+    const d = new Date(txnDate.slice(0, 10) + 'T00:00:00');
+    d.setDate(d.getDate() + creditDays);
+    return d.toISOString().slice(0, 10);
+  }
+  function daysRemaining(maturityDate) {
+    if (!maturityDate) return null;
+    const today = new Date(new Date().toISOString().slice(0, 10));
+    const maturity = new Date(maturityDate + 'T00:00:00');
+    return Math.floor((maturity - today) / 86400000);
+  }
+
+  function billKeyOf(l) {
+    const billNo = (l.notes || '').split(' | Remark: ')[0].trim();
+    return `${l.type}||${l.party_name || ''}||${billNo}||${l.date.slice(0, 10)}`;
+  }
+
+  /** Groups raw ledger rows into bills the way the original does: one bill
+   *  = same type + party + reference-note + date. Each bill carries its own
+   *  credit days (taken from its rows), paid status, and computed status. */
+  function groupIntoBills(rows) {
+    const map = new Map();
+    rows.forEach(l => {
+      const key = billKeyOf(l);
+      if (!map.has(key)) {
+        map.set(key, {
+          key, type: l.type, party: l.party_name || '',
+          billNo: (l.notes || '').split(' | Remark: ')[0].trim(),
+          date: l.date.slice(0, 10), creditDays: l.credit_days || 0,
+          paid: !!l.is_paid, rows: []
+        });
+      }
+      const bill = map.get(key);
+      const item = getItem(l.item_id);
+      bill.rows.push({ name: item ? item.name : '?', qty: l.qty, unit: item ? item.unit : '', id: l.id });
+    });
+    return Array.from(map.values());
+  }
+  function billStatus(b) {
+    if (b.paid) return 'paid';
+    if (!b.creditDays) return 'no-credit';
+    const mat = calcMaturityDate(b.date, b.creditDays);
+    const dr = mat ? daysRemaining(mat) : null;
+    if (dr === null) return 'no-credit';
+    if (dr < 0) return 'overdue';
+    if (dr <= 7) return 'due-soon';
+    return 'not-due';
+  }
+  function toggleBillPaid(billKey) {
+    const newPaid = !billPaidState(billKey);
+    db.stock_ledger.forEach(l => { if (billKeyOf(l) === billKey) l.is_paid = newPaid; });
+    persist();
+  }
+  function billPaidState(billKey) {
+    const row = db.stock_ledger.find(l => billKeyOf(l) === billKey);
+    return row ? !!row.is_paid : false;
+  }
+  function supplierLedgerBills() { return groupIntoBills(db.stock_ledger.filter(l => l.ref_type === 'purchase')); }
+  function customerLedgerBills() { return groupIntoBills(db.stock_ledger.filter(l => l.ref_type === 'sale_manual')); }
 
   /* ---------- INDENTS (what a client wants, before pricing) ---------- */
 
@@ -583,7 +770,7 @@ const Core = (() => {
     return `${prefix}-${yr}-${String(count).padStart(3, '0')}`;
   }
 
-  function createQuotation(indent_id, doc_type, pricedLines) {
+  async function createQuotation(indent_id, doc_type, pricedLines) {
     const indent = getIndent(indent_id);
     if (!indent) throw new Error('Unknown indent');
     const total = +pricedLines.reduce((s, l) => s + l.amount, 0).toFixed(2);
@@ -599,9 +786,10 @@ const Core = (() => {
 
     // Cash Bill = money already changed hands -> confirm immediately.
     // Quotation / Proforma Invoice = still a proposal -> wait for explicit confirm.
-    if (doc_type === 'CB') confirmQuotation(quotation.id);
+    let confirmResult = { ok: true };
+    if (doc_type === 'CB') confirmResult = await confirmQuotation(quotation.id);
 
-    return quotation;
+    return { quotation, confirmResult };
   }
 
   function listQuotations(filter = {}) {
@@ -611,13 +799,23 @@ const Core = (() => {
   function getQuotation(id) { return db.quotations.find(q => q.id === id) || null; }
 
   /** The loop-back: confirming a quotation deducts stock (existing Inventory
-   *  stock-out concept) and marks the party Won (existing Lead concept). */
-  function confirmQuotation(id) {
+   *  stock-out concept) and marks the party Won (existing Lead concept).
+   *  Each line is a server-verified stock move — if any item doesn't have
+   *  enough real stock (e.g. sold on another device in the meantime), that
+   *  line is rejected and reported, and the quotation is only marked
+   *  confirmed if every line succeeded. */
+  async function confirmQuotation(id) {
     const quotation = getQuotation(id);
-    if (!quotation || quotation.status === 'confirmed') return quotation;
-    quotation.lines.forEach(l => {
-      stockMove(l.item_id, 'out', l.qty, { ref_type: 'sale', ref_id: quotation.id, party_id: quotation.party_id, notes: `${quotation.doc_type} ${quotation.doc_no}` });
-    });
+    if (!quotation || quotation.status === 'confirmed') return { ok: true, quotation };
+    const failures = [];
+    for (const l of quotation.lines) {
+      const result = await stockMove(l.item_id, 'out', l.qty, { ref_type: 'sale', ref_id: quotation.id, party_id: quotation.party_id, notes: `${quotation.doc_type} ${quotation.doc_no}` });
+      if (!result.ok) failures.push({ item_id: l.item_id, name: l.name, error: result.error });
+    }
+    if (failures.length) {
+      persist();
+      return { ok: false, failures, quotation };
+    }
     quotation.status = 'confirmed';
     quotation.confirmed_at = now();
     const indent = getIndent(quotation.indent_id);
@@ -629,7 +827,7 @@ const Core = (() => {
       logActivity(quotation.party_id, 'sale', `${quotation.doc_type} ${quotation.doc_no} confirmed — ₹${quotation.total}`);
     }
     persist();
-    return quotation;
+    return { ok: true, quotation };
   }
 
   function rejectQuotation(id, note = '') {
@@ -687,17 +885,44 @@ const Core = (() => {
       if (!this.enabled) return;
       const rows = db[table];
       if (!rows.length) return;
+      // stock_qty on 'items' is server-authoritative (computed by trigger
+      // from stock_ledger) — never let the client's optimistic local value
+      // overwrite it on push.
+      const payload = table === 'items' ? rows.map(({ stock_qty, ...rest }) => rest) : rows;
       try {
         this.syncing = true;
         const res = await fetch(`${this.url}/rest/v1/${table}`, {
           method: 'POST',
           headers: Object.assign(this.headers(), { 'Prefer': 'resolution=merge-duplicates' }),
-          body: JSON.stringify(rows)
+          body: JSON.stringify(payload)
         });
         this.lastError = res.ok ? null : await res.text();
       } catch (e) { this.lastError = e.message; }
       this.syncing = false;
       document.dispatchEvent(new CustomEvent('core:sync'));
+    },
+
+    /** Pushes a single stock_ledger row and waits for Postgres to accept or
+     *  reject it (via the negative-stock guard trigger). Returns
+     *  {ok:true} on success, {ok:true, offline:true} if unreachable
+     *  (accepted optimistically, will sync later), or {ok:false, error}
+     *  if the server actively rejected the move. */
+    async pushLedgerRowVerified(row) {
+      if (!this.enabled) return { ok: true };
+      try {
+        const res = await fetch(`${this.url}/rest/v1/stock_ledger`, {
+          method: 'POST',
+          headers: Object.assign(this.headers(), { 'Prefer': 'return=minimal' }),
+          body: JSON.stringify([row])
+        });
+        if (!res.ok) {
+          const text = await res.text();
+          return { ok: false, error: parseServerError(text) };
+        }
+        return { ok: true };
+      } catch (e) {
+        return { ok: true, offline: true };
+      }
     },
 
     pushDirty() { TABLES.forEach(t => this.pushTable(t)); },
@@ -732,6 +957,13 @@ const Core = (() => {
     db[table] = Array.from(byId.values());
   }
 
+  function parseServerError(text) {
+    try {
+      const j = JSON.parse(text);
+      return (j.message || j.hint || text).replace(/^P0001: /, '');
+    } catch (e) { return text; }
+  }
+
   function enableCloudSync(url, key) { cloud.init(url, key); }
   function cloudStatus() { return { enabled: cloud.enabled, syncing: cloud.syncing, error: cloud.lastError }; }
   function tryAutoConnectCloud() { cloud.tryAutoConnect(); }
@@ -751,7 +983,10 @@ const Core = (() => {
     addItem, getItem, listItems, updateItemPrice,
     WIRE_COLORS, PIPE_SIZES, CS_BG, CS_TX, isWire, isPipe, isPurePipe, baseName, getPipeSize, itemBrands,
     // stock
-    stockMove, lowStockItems,
+    stockMove, lowStockItems, recordDamageOrReturn, listDamageLog, transferStock, listTransfers,
+    autoSaveParty, ledgerPartyNames, findLikelyDuplicates,
+    partyLedger, calcMaturityDate, daysRemaining, groupIntoBills, billStatus, toggleBillPaid,
+    supplierLedgerBills, customerLedgerBills,
     // indents
     createIndent, listIndents, getIndent, priceIndent,
     // quotations
@@ -1573,29 +1808,62 @@ const Leads = (() => {
 
 const Inventory = (() => {
 
-  let view = 'stock';      // 'stock' | 'master'
+  let view = 'stock';      // 'stock' | 'master' | 'damage' | 'transfer'
   let brandFilter = '';
+  let currentLoc = 'GODOWN'; // 'GODOWN' | 'OFFICE'
+  let dmgQueue = [];
+  let dmgSelItemId = '';
+  let trSelItemId = '';
 
   function render() {
+    if (view === 'si') { renderSI(); return; }
+    if (view === 'so') { renderSO(); return; }
     if (view === 'master') { renderMaster(); return; }
+    if (view === 'damage') { renderDamage(); return; }
+    if (view === 'transfer') { renderTransfer(); return; }
+    if (view === 'partymaster') { renderPartyMaster(); return; }
+    if (view === 'partyledger') { renderPartyLedgerView(); return; }
+    if (view === 'supplierledger') { renderRoleLedger('SUPPLIER'); return; }
+    if (view === 'customerledger') { renderRoleLedger('CUSTOMER'); return; }
+    if (view === 'pipestock') { renderPipeStock(); return; }
     renderClosingStock();
   }
 
   function tabsHtml() {
     return `
-      <div style="display:flex; gap:6px; margin-bottom:16px;">
-        <button class="btn ${view === 'stock' ? '' : 'ghost'} sm view-tab" data-view="stock">📊 Closing Stock</button>
-        <button class="btn ${view === 'master' ? '' : 'ghost'} sm view-tab" data-view="master">🗂 Item Master</button>
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; flex-wrap:wrap; gap:10px;">
+        <div style="display:flex; gap:6px; flex-wrap:wrap;">
+          <button class="btn ${view === 'si' ? '' : 'ghost'} sm view-tab" data-view="si">📥 Stock In</button>
+          <button class="btn ${view === 'so' ? '' : 'ghost'} sm view-tab" data-view="so">📤 Stock Out</button>
+          <button class="btn ${view === 'stock' ? '' : 'ghost'} sm view-tab" data-view="stock">📊 Closing Stock</button>
+          <button class="btn ${view === 'pipestock' ? '' : 'ghost'} sm view-tab" data-view="pipestock">🪠 Pipe Stock</button>
+          <button class="btn ${view === 'master' ? '' : 'ghost'} sm view-tab" data-view="master">🗂 Item Master</button>
+          <button class="btn ${view === 'damage' ? '' : 'ghost'} sm view-tab" data-view="damage">🔴 Damage/Return</button>
+          <button class="btn ${view === 'transfer' ? '' : 'ghost'} sm view-tab" data-view="transfer">🔁 Transfer</button>
+          <button class="btn ${view === 'partymaster' ? '' : 'ghost'} sm view-tab" data-view="partymaster">👥 Party Master</button>
+          <button class="btn ${view === 'partyledger' ? '' : 'ghost'} sm view-tab" data-view="partyledger">📒 Party Ledger</button>
+          <button class="btn ${view === 'supplierledger' ? '' : 'ghost'} sm view-tab" data-view="supplierledger">🏷 Supplier Ledger</button>
+          <button class="btn ${view === 'customerledger' ? '' : 'ghost'} sm view-tab" data-view="customerledger">🧾 Customer Ledger</button>
+        </div>
+        <div style="display:flex; gap:4px; background:var(--paper-dim); padding:3px; border-radius:6px;">
+          <button class="btn sm ${currentLoc === 'GODOWN' ? 'amber' : 'ghost'} loc-btn" data-loc="GODOWN" style="${currentLoc !== 'GODOWN' ? 'border:none;' : ''}">🏭 Godown</button>
+          <button class="btn sm ${currentLoc === 'OFFICE' ? 'amber' : 'ghost'} loc-btn" data-loc="OFFICE" style="${currentLoc !== 'OFFICE' ? 'border:none;' : ''}">🏢 Office</button>
+        </div>
       </div>
     `;
+  }
+  function wireTabEvents() {
+    document.querySelectorAll('.view-tab').forEach(b => b.onclick = () => { view = b.dataset.view; render(); });
+    document.querySelectorAll('.loc-btn').forEach(b => b.onclick = () => { currentLoc = b.dataset.loc; brandFilter = ''; render(); });
   }
 
   /* ---------- CLOSING STOCK: brand-grouped, wire/pipe matrix ---------- */
 
   function renderClosingStock() {
     const main = document.getElementById('main');
-    const brands = Core.itemBrands();
-    const low = Core.lowStockItems();
+    const brands = Core.itemBrands(currentLoc);
+    const locItems = Core.listItems({ location: currentLoc });
+    const low = locItems.filter(i => i.min_stock > 0 && i.stock_qty <= i.min_stock);
 
     main.innerHTML = `
       <div class="page-head">
@@ -1609,7 +1877,7 @@ const Inventory = (() => {
       ${tabsHtml()}
 
       <div class="stat-row">
-        <div class="stat"><div class="stat-num">${Core.listItems().length}</div><div class="stat-label">Items</div></div>
+        <div class="stat"><div class="stat-num">${locItems.length}</div><div class="stat-label">Items (${currentLoc === 'GODOWN' ? 'Godown' : 'Office'})</div></div>
         <div class="stat"><div class="stat-num">${brands.length}</div><div class="stat-label">Brands</div></div>
         <div class="stat"><div class="stat-num" style="color:${low.length ? 'var(--red)' : 'inherit'}">${low.length}</div><div class="stat-label">Low Stock Alerts</div></div>
       </div>
@@ -1633,7 +1901,7 @@ const Inventory = (() => {
     `;
 
     document.getElementById('btn-add-item').onclick = openAddItemModal;
-    document.querySelectorAll('.view-tab').forEach(b => b.onclick = () => { view = b.dataset.view; render(); });
+    wireTabEvents();
     document.getElementById('cs-brand').onchange = (e) => { brandFilter = e.target.value; renderBrandStock(); };
     if (brandFilter) renderBrandStock();
   }
@@ -1641,11 +1909,11 @@ const Inventory = (() => {
   function renderBrandStock() {
     const el = document.getElementById('cs-results');
     if (!brandFilter) { el.innerHTML = ''; return; }
-    const items = Core.listItems().filter(i => (i.brand || 'Unknown Brand') === brandFilter);
+    const items = Core.listItems({ location: currentLoc }).filter(i => (i.brand || 'Unknown Brand') === brandFilter);
     if (!items.length) { el.innerHTML = `<div class="empty">No items for this brand.</div>`; return; }
 
     const wireItems = items.filter(Core.isWire);
-    const pipeItems = items.filter(i => Core.isPurePipe(i));
+    const pipeItems = items.filter(i => Core.isPipe(i));
     const otherItems = items.filter(i => !Core.isWire(i) && !Core.isPipe(i));
 
     let html = `<div class="card" style="padding:0; overflow:hidden;">`;
@@ -1743,7 +2011,7 @@ const Inventory = (() => {
 
   function renderMaster() {
     const main = document.getElementById('main');
-    const items = Core.listItems();
+    const items = Core.listItems({ location: currentLoc });
 
     main.innerHTML = `
       <div class="page-head">
@@ -1757,7 +2025,7 @@ const Inventory = (() => {
       ${tabsHtml()}
 
       <div class="card">
-        <div class="card-title">Item Master (${items.length})</div>
+        <div class="card-title">Item Master — ${currentLoc === 'GODOWN' ? 'Godown' : 'Office'} (${items.length})</div>
         ${items.length ? `
           <table>
             <thead><tr><th>Item</th><th>Brand</th><th>Cost</th><th>Sell</th><th>Stock</th><th></th></tr></thead>
@@ -1777,12 +2045,12 @@ const Inventory = (() => {
               `).join('')}
             </tbody>
           </table>
-        ` : `<div class="empty">No items yet. <b>Add your first item.</b></div>`}
+        ` : `<div class="empty">No items yet in ${currentLoc === 'GODOWN' ? 'Godown' : 'Office'}. <b>Add your first item.</b></div>`}
       </div>
     `;
 
     document.getElementById('btn-add-item').onclick = openAddItemModal;
-    document.querySelectorAll('.view-tab').forEach(b => b.onclick = () => { view = b.dataset.view; render(); });
+    wireTabEvents();
     document.querySelectorAll('.stock-in-btn').forEach(b => b.onclick = () => openStockModal(b.dataset.id, 'in'));
     document.querySelectorAll('.stock-out-btn').forEach(b => b.onclick = () => openStockModal(b.dataset.id, 'out'));
   }
@@ -1807,7 +2075,12 @@ const Inventory = (() => {
         <div class="field"><label>Cost Price (₹)</label><input id="f-cost" type="number" value="0"></div>
         <div class="field"><label>Sell Price (₹)</label><input id="f-sell" type="number" value="0"></div>
       </div>
-      <div class="field"><label>HSN Code</label><input id="f-hsn" placeholder="Optional"></div>
+      <div class="field-row">
+        <div class="field"><label>HSN Code</label><input id="f-hsn" placeholder="Optional"></div>
+        <div class="field"><label>Location</label>
+          <select id="f-location"><option value="GODOWN" ${currentLoc === 'GODOWN' ? 'selected' : ''}>🏭 Godown</option><option value="OFFICE" ${currentLoc === 'OFFICE' ? 'selected' : ''}>🏢 Office</option></select>
+        </div>
+      </div>
       <button class="btn amber" id="save-item" style="width:100%; justify-content:center; margin-top:6px;">Save Item</button>
     `);
     document.getElementById('save-item').onclick = () => {
@@ -1820,45 +2093,812 @@ const Inventory = (() => {
         cost_price: document.getElementById('f-cost').value,
         sell_price: document.getElementById('f-sell').value,
         hsn: document.getElementById('f-hsn').value.trim(),
-        min_stock: document.getElementById('f-threshold').value
+        min_stock: document.getElementById('f-threshold').value,
+        location: document.getElementById('f-location').value
       });
       closeModal(); toast('Item added'); render();
     };
   }
 
+  // row/matrix clicks now jump into the proper Stock In / Stock Out tab
+  // with the item pre-selected — matching the original, which has no
+  // separate quick-modal; SI/SO tabs are the only path to adjust stock.
+  document.addEventListener('click', (e) => {
+    const cell = e.target.closest('.wire-cell');
+    if (cell) { view = 'so'; siPreselect = null; soPreselect = cell.dataset.id; render(); }
+  });
   function openStockModal(item_id, type) {
-    const item = Core.getItem(item_id);
-    showModal(`${type === 'in' ? 'Stock In' : 'Stock Out'} — ${item.name}`, `
-      <div class="hint" style="margin-bottom:10px;">Current stock: <b>${item.stock_qty} ${esc(item.unit)}</b></div>
-      <div class="field"><label>Quantity</label><input id="f-qty" type="number" min="1" value="1"></div>
-      <div class="field"><label>Note</label><input id="f-note" placeholder="${type === 'in' ? 'e.g. Purchase from supplier' : 'e.g. Manual correction'}"></div>
-      <button class="btn amber" id="save-stock" style="width:100%; justify-content:center; margin-top:6px;">Confirm ${type === 'in' ? 'Stock In' : 'Stock Out'}</button>
-    `);
-    document.getElementById('save-stock').onclick = () => {
-      const qty = Number(document.getElementById('f-qty').value);
+    view = type === 'in' ? 'si' : 'so';
+    if (type === 'in') siPreselect = item_id; else soPreselect = item_id;
+    render();
+  }
+
+  let siQueue = [], soQueue = [], siSelItemId = '', soSelItemId = '', siPreselect = null, soPreselect = null;
+  const CLR_CSS = {
+    RED: 'background:#e53935;color:#fff', YELLOW: 'background:#FDD835;color:#333', GREEN: 'background:#7CB342;color:#fff',
+    BLUE: 'background:#1E88E5;color:#fff', BLACK: 'background:#212121;color:#FF8F00',
+    WHITE: 'background:#f5f5f5;color:#333;border:1px solid #ccc', GREY: 'background:#9E9E9E;color:#fff'
+  };
+
+  function renderSI() { renderSIorSO('si'); }
+  function renderSO() { renderSIorSO('so'); }
+
+  function renderSIorSO(prefix) {
+    const isIn = prefix === 'si';
+    const main = document.getElementById('main');
+    const brands = Core.itemBrands(currentLoc);
+    const queue = isIn ? siQueue : soQueue;
+    const preselect = isIn ? siPreselect : soPreselect;
+    if (preselect) { (isIn ? (siSelItemId = preselect) : (soSelItemId = preselect)); }
+
+    main.innerHTML = `
+      <div class="page-head">
+        <div>
+          <div class="page-title">${isIn ? 'Stock In' : 'Stock Out'}</div>
+          <div class="page-desc">${isIn ? 'Receiving stock from a supplier.' : 'Stock going out to a customer.'} Build a batch, then submit together.</div>
+        </div>
+      </div>
+      ${tabsHtml()}
+
+      <div class="card">
+        <div class="card-title">Add to Batch</div>
+        <div class="field"><label>Brand</label>
+          <select id="${prefix}-brand"><option value="">— All Brands —</option>${brands.map(b => `<option ${b === brandFilter ? 'selected' : ''}>${esc(b)}</option>`).join('')}</select>
+        </div>
+        <div class="field"><label>Item</label><select id="${prefix}-item"><option value="">— Select Item —</option></select></div>
+        <div id="${prefix}-clr-box" style="display:none; margin-bottom:10px;">
+          <div class="hint" style="margin-bottom:4px;">Pick the colour:</div>
+          <div id="${prefix}-clr-btns" style="display:flex; gap:6px; flex-wrap:wrap;"></div>
+        </div>
+        <div class="hint" id="${prefix}-cur-stk" style="margin-bottom:8px;"></div>
+        <div class="field-row">
+          <div class="field"><label>Quantity</label><input id="${prefix}-qty" type="number" min="1"></div>
+          <div class="field" style="display:flex; align-items:flex-end;"><button class="btn amber" id="${prefix}-add-btn" style="width:100%; justify-content:center;">+ Add to Batch</button></div>
+        </div>
+      </div>
+
+      <div class="card" id="${prefix}-q-card" style="${queue.length ? '' : 'display:none;'}">
+        <div class="card-title">Batch (<span id="${prefix}-q-count">${queue.length}</span> items)</div>
+        <div id="${prefix}-q-table"></div>
+        <div class="field" style="margin-top:12px; position:relative;">
+          <label>${isIn ? 'Supplier' : 'Customer'} Name *</label>
+          <input id="${prefix}-party" list="${prefix}-party-list" placeholder="Type or pick existing party">
+          <datalist id="${prefix}-party-list">${Core.ledgerPartyNames().map(n => `<option value="${esc(n)}">`).join('')}</datalist>
+        </div>
+        <div class="field-row">
+          <div class="field"><label>Reference / Note</label><input id="${prefix}-note" placeholder="e.g. Bill No."></div>
+          <div class="field"><label>Date</label><input id="${prefix}-date" type="date" value="${todayStr()}"></div>
+        </div>
+        ${!isIn ? `
+        <div class="field-row">
+          <div class="field"><label>Credit Days (optional)</label><input id="${prefix}-credit" type="number" min="0" placeholder="0"></div>
+          <div class="field"><label>Due Date</label><div class="hint" id="${prefix}-due-preview" style="padding-top:9px;">—</div></div>
+        </div>` : ''}
+        <div class="field-row">
+          <div class="field"><label>Operator</label><input id="${prefix}-operator" placeholder="Who's entering this" value="${localStorage.getItem('sse_operator') || ''}"></div>
+          <div class="field"><label>Remarks</label><input id="${prefix}-remarks" placeholder="Optional"></div>
+        </div>
+        <div style="display:flex; gap:8px;">
+          <button class="btn amber" id="${prefix}-submit-btn" style="flex:1; justify-content:center;">Submit ${isIn ? 'Stock In' : 'Stock Out'}</button>
+          <button class="btn danger" id="${prefix}-clear-btn">Clear</button>
+        </div>
+      </div>
+    `;
+
+    wireTabEvents();
+    fillQItems(prefix);
+    if (preselect) { document.getElementById(prefix + '-item').value = preselect; onQItemChange(prefix); }
+    if (isIn) siPreselect = null; else soPreselect = null;
+
+    document.getElementById(prefix + '-brand').onchange = () => fillQItems(prefix);
+    document.getElementById(prefix + '-item').onchange = () => onQItemChange(prefix);
+    document.getElementById(prefix + '-add-btn').onclick = () => addToStockQueue(prefix);
+    renderStockQueue(prefix);
+    const submitBtn = document.getElementById(prefix + '-submit-btn');
+    if (submitBtn) submitBtn.onclick = () => submitStockQueue(prefix);
+    const clearBtn = document.getElementById(prefix + '-clear-btn');
+    if (clearBtn) clearBtn.onclick = () => { if (confirm('Clear the batch?')) { if (isIn) siQueue = []; else soQueue = []; render(); } };
+    if (!isIn) {
+      const creditEl = document.getElementById(prefix + '-credit');
+      const dateEl = document.getElementById(prefix + '-date');
+      const updateDue = () => {
+        const days = Number(creditEl.value) || 0;
+        const preview = document.getElementById(prefix + '-due-preview');
+        if (!days) { preview.textContent = '—'; return; }
+        const d = new Date(dateEl.value || todayStr()); d.setDate(d.getDate() + days);
+        preview.textContent = fmtDate(d.toISOString());
+      };
+      if (creditEl) { creditEl.oninput = updateDue; dateEl.onchange = updateDue; }
+    }
+  }
+
+  function fillQItems(prefix) {
+    const brand = document.getElementById(prefix + '-brand').value;
+    const sel = document.getElementById(prefix + '-item');
+    const items = Core.listItems({ location: currentLoc }).filter(i => !brand || (i.brand || 'Unknown Brand') === brand);
+    sel.innerHTML = '<option value="">— Select Item —</option>' + items.map(i =>
+      `<option value="${i.id}">${esc(i.name)} (${esc(i.unit)}) — Stock: ${i.stock_qty}${i.stock_qty <= i.min_stock && i.min_stock > 0 ? ' ⚠' : ''}</option>`).join('');
+    document.getElementById(prefix + '-clr-box').style.display = 'none';
+    document.getElementById(prefix + '-cur-stk').textContent = '';
+    if (prefix === 'si') siSelItemId = ''; else soSelItemId = '';
+  }
+
+  function onQItemChange(prefix) {
+    const itemId = document.getElementById(prefix + '-item').value;
+    if (prefix === 'si') siSelItemId = itemId; else soSelItemId = itemId;
+    const stkEl = document.getElementById(prefix + '-cur-stk');
+    const clrBox = document.getElementById(prefix + '-clr-box');
+    if (!itemId) { clrBox.style.display = 'none'; stkEl.textContent = ''; return; }
+    const item = Core.getItem(itemId);
+    if (!item) return;
+    showStockFor(prefix, item);
+
+    if (Core.isWire(item)) {
+      const base = Core.baseName(item.name), brand = item.brand || '';
+      const variants = Core.listItems({ location: currentLoc }).filter(i => (i.brand || '') === brand && Core.baseName(i.name) === base);
+      const colored = variants.filter(i => Core.WIRE_COLORS.some(c => i.name.toUpperCase().endsWith(' ' + c)));
+      if (colored.length > 1) {
+        const btnsEl = document.getElementById(prefix + '-clr-btns');
+        btnsEl.innerHTML = '';
+        const curColor = Core.WIRE_COLORS.find(c => item.name.toUpperCase().endsWith(' ' + c));
+        Core.WIRE_COLORS.forEach(c => {
+          const v = colored.find(i => i.name.toUpperCase().endsWith(' ' + c));
+          if (!v) return;
+          const vlow = v.stock_qty <= v.min_stock && v.min_stock > 0;
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          btn.style.cssText = (CLR_CSS[c] || 'background:#888;color:#fff') + ';padding:6px 12px;border-radius:20px;border:none;font-size:11px;font-weight:700;cursor:pointer;' + (c === curColor ? 'outline:3px solid var(--navy-700);' : '');
+          btn.innerHTML = `● ${c} <span style="font-size:10px;opacity:.85">(${v.stock_qty})${vlow ? ' ⚠' : ''}</span>`;
+          btn.onclick = () => {
+            btnsEl.querySelectorAll('button').forEach(b => b.style.outline = 'none');
+            btn.style.outline = '3px solid var(--navy-700)';
+            if (prefix === 'si') siSelItemId = v.id; else soSelItemId = v.id;
+            showStockFor(prefix, v);
+            document.getElementById(prefix + '-qty').focus();
+          };
+          btnsEl.appendChild(btn);
+        });
+        clrBox.style.display = 'block';
+        return;
+      }
+    }
+    clrBox.style.display = 'none';
+  }
+  function showStockFor(prefix, item) {
+    const low = item.stock_qty <= item.min_stock && item.min_stock > 0;
+    const el = document.getElementById(prefix + '-cur-stk');
+    el.innerHTML = `Current stock: <b style="color:${low ? 'var(--red)' : 'var(--green)'}">${item.stock_qty} ${esc(item.unit)}</b>${low ? ' ⚠' : ''}`;
+  }
+
+  function addToStockQueue(prefix) {
+    const isIn = prefix === 'si';
+    const itemId = isIn ? siSelItemId : soSelItemId;
+    const qty = Number(document.getElementById(prefix + '-qty').value);
+    if (!itemId) { toast('Select an item'); return; }
+    if (!qty || qty <= 0) { toast('Enter quantity'); return; }
+    const item = Core.getItem(itemId);
+    if (!item) return;
+    if (!isIn && qty > item.stock_qty) { toast('Not enough stock! Available: ' + item.stock_qty); return; }
+    const queue = isIn ? siQueue : soQueue;
+    const existing = queue.find(x => x.itemId === itemId);
+    if (existing) { existing.qty += qty; toast('Qty updated ✓'); }
+    else { queue.push({ itemId, qty, name: item.name, brand: item.brand || '', unit: item.unit }); toast('Added to batch ✓'); }
+    document.getElementById(prefix + '-qty').value = '';
+    document.getElementById(prefix + '-qty').focus();
+    renderStockQueue(prefix);
+  }
+
+  function renderStockQueue(prefix) {
+    const isIn = prefix === 'si';
+    const queue = isIn ? siQueue : soQueue;
+    const card = document.getElementById(prefix + '-q-card');
+    const countEl = document.getElementById(prefix + '-q-count');
+    if (countEl) countEl.textContent = queue.length;
+    if (!card) return;
+    card.style.display = queue.length ? 'block' : 'none';
+    if (!queue.length) return;
+    const wrap = document.getElementById(prefix + '-q-table');
+    wrap.innerHTML = `
+      <table>
+        <thead><tr><th>Item</th><th>Brand</th><th>Qty</th><th>Unit</th><th></th></tr></thead>
+        <tbody>
+          ${queue.map((x, i) => `
+            <tr>
+              <td>${esc(x.name)}</td>
+              <td style="color:var(--navy-700);">${esc(x.brand)}</td>
+              <td style="font-weight:700;">${x.qty}</td>
+              <td>${esc(x.unit)}</td>
+              <td style="text-align:right;"><button class="btn sm danger q-rm-btn" data-prefix="${prefix}" data-idx="${i}">✕</button></td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>
+    `;
+    wrap.querySelectorAll('.q-rm-btn').forEach(b => b.onclick = () => {
+      const q = b.dataset.prefix === 'si' ? siQueue : soQueue;
+      q.splice(Number(b.dataset.idx), 1);
+      renderStockQueue(b.dataset.prefix);
+    });
+  }
+
+  async function submitStockQueue(prefix) {
+    const isIn = prefix === 'si';
+    const queue = isIn ? siQueue : soQueue;
+    if (!queue.length) { toast('Batch is empty'); return; }
+    const partyEl = document.getElementById(prefix + '-party');
+    const party = partyEl.value.trim();
+    if (!party) { toast(`Enter ${isIn ? 'Supplier' : 'Customer'} name`); partyEl.focus(); return; }
+    const note = document.getElementById(prefix + '-note').value.trim();
+    const remarks = document.getElementById(prefix + '-remarks').value.trim();
+    const fullNote = note + (remarks ? ' | Remark: ' + remarks : '');
+    const date = document.getElementById(prefix + '-date').value || todayStr();
+    const operator = document.getElementById(prefix + '-operator').value.trim();
+    if (operator) localStorage.setItem('sse_operator', operator);
+    const creditDays = !isIn ? (Number(document.getElementById(prefix + '-credit').value) || 0) : 0;
+
+    if (!isIn) {
+      const short = queue.filter(x => x.qty > Core.getItem(x.itemId).stock_qty);
+      if (short.length) { toast('Not enough stock: ' + short.map(x => x.name).join(', ')); return; }
+    }
+
+    const dupes = Core.findLikelyDuplicates(queue.map(x => ({ itemId: x.itemId, qty: x.qty, partyName: party, name: x.name })), isIn ? 'in' : 'out', date);
+    if (dupes.length) {
+      const names = dupes.map(d => d.name).join(', ');
+      if (!confirm(`⚠ Possible duplicate detected!\n\nSame item, qty, party and date already exists:\n${names}\n\nContinue anyway?`)) return;
+    }
+    if (!confirm(`Submit ${isIn ? 'Stock IN' : 'Stock OUT'} for ${queue.length} item(s) to ${isIn ? 'Supplier' : 'Customer'}: ${party}?\nDate: ${date}${note ? ' | Ref: ' + note : ''}${operator ? ' | By: ' + operator : ''}`)) return;
+
+    const submitBtn = document.getElementById(prefix + '-submit-btn');
+    if (submitBtn) { submitBtn.disabled = true; submitBtn.textContent = 'Submitting…'; }
+
+    const failures = [];
+    for (const x of queue) {
+      const result = await Core.stockMove(x.itemId, isIn ? 'in' : 'out', x.qty, {
+        ref_type: isIn ? 'purchase' : 'sale_manual', party_name: party, operator,
+        credit_days: creditDays, notes: fullNote, date
+      });
+      if (!result.ok) failures.push({ name: x.name, error: result.error });
+    }
+    Core.autoSaveParty(party, isIn ? 'SUPPLIER' : 'CUSTOMER');
+    const submitted = queue.length - failures.length;
+
+    if (failures.length) {
+      // keep only the failed items in the batch so nothing already
+      // submitted gets re-sent, and the user can see what to fix/retry
+      if (isIn) siQueue = queue.filter(x => failures.some(f => f.name === x.name));
+      else soQueue = queue.filter(x => failures.some(f => f.name === x.name));
+      alert(`⚠ ${failures.length} item(s) were rejected by the server and NOT recorded:\n\n` +
+        failures.map(f => `• ${f.name}: ${f.error}`).join('\n') +
+        (submitted ? `\n\n${submitted} other item(s) submitted successfully.` : ''));
+    } else {
+      if (isIn) siQueue = []; else soQueue = [];
+    }
+    toast(submitted ? `${submitted} item${submitted > 1 ? 's' : ''} submitted 🎉` : 'Submission failed');
+    render();
+  }
+
+  function todayStr() { return new Date().toISOString().slice(0, 10); }
+
+  /* ---------- DAMAGE / RETURN: batch queue entry ---------- */
+
+  function renderDamage() {
+    const main = document.getElementById('main');
+    const brands = Core.itemBrands(currentLoc);
+    const history = Core.listDamageLog().filter(l => {
+      const item = Core.getItem(l.item_id);
+      return item && (item.location || 'GODOWN') === currentLoc;
+    }).slice(0, 30);
+
+    main.innerHTML = `
+      <div class="page-head">
+        <div>
+          <div class="page-title">Damage / Return</div>
+          <div class="page-desc">Log damaged stock leaving, or stock returning from a supplier credit — as a batch.</div>
+        </div>
+      </div>
+      ${tabsHtml()}
+
+      <div class="card">
+        <div class="card-title">Add to Batch</div>
+        <div class="field-row">
+          <div class="field"><label>Brand</label>
+            <select id="dmg-brand"><option value="">— All Brands —</option>${brands.map(b => `<option>${esc(b)}</option>`).join('')}</select>
+          </div>
+          <div class="field"><label>Entry Type</label>
+            <select id="dmg-type"><option value="DAMAGE">🔴 DAMAGE (stock out)</option><option value="RETURN">🟢 RETURN (stock in)</option></select>
+          </div>
+        </div>
+        <div class="field"><label>Item</label><select id="dmg-item"><option value="">— Select Item —</option></select></div>
+        <div class="hint" id="dmg-cur-stk" style="margin-bottom:8px;"></div>
+        <div class="field-row">
+          <div class="field"><label>Quantity</label><input id="dmg-qty" type="number" min="1"></div>
+          <div class="field" style="display:flex; align-items:flex-end;"><button class="btn amber" id="dmg-add-btn" style="width:100%; justify-content:center;">+ Add to Batch</button></div>
+        </div>
+      </div>
+
+      <div class="card" id="dmg-q-card" style="${dmgQueue.length ? '' : 'display:none;'}">
+        <div class="card-title">Batch (<span id="dmg-q-count">${dmgQueue.length}</span> items)</div>
+        <div id="dmg-q-table"></div>
+        <div class="field-row" style="margin-top:12px;">
+          <div class="field"><label>Party (optional)</label><input id="dmg-party" placeholder="Supplier / customer name"></div>
+          <div class="field"><label>Date</label><input id="dmg-date" type="date" value="${todayStr()}"></div>
+        </div>
+        <div class="field"><label>Reference / Notes</label><input id="dmg-note" placeholder="e.g. Bill No, reason"></div>
+        <div style="display:flex; gap:8px;">
+          <button class="btn amber" id="dmg-submit-btn" style="flex:1; justify-content:center;">Submit Batch</button>
+          <button class="btn danger" id="dmg-clear-btn">Clear</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Recent Damage / Return History</div>
+        ${history.length ? `
+          <table>
+            <thead><tr><th>Date</th><th>Type</th><th>Item</th><th>Qty</th><th>Party</th><th>Notes</th></tr></thead>
+            <tbody>
+              ${history.map(l => {
+                const item = Core.getItem(l.item_id);
+                const isDmg = l.ref_type === 'damage';
+                return `<tr>
+                  <td>${fmtDate(l.date)}</td>
+                  <td><span class="badge ${isDmg ? 'lost' : 'confirmed'}">${isDmg ? '🔴 DAMAGE' : '🟢 RETURN'}</span></td>
+                  <td>${esc(item ? item.name : '?')}</td>
+                  <td style="font-weight:700;">${l.qty}</td>
+                  <td style="font-size:12px;">${esc(l.party_name || '—')}</td>
+                  <td style="font-size:12px; color:var(--ink-dim);">${esc(l.notes || '—')}</td>
+                </tr>`;
+              }).join('')}
+            </tbody>
+          </table>
+        ` : `<div class="empty">No damage or return entries yet.</div>`}
+      </div>
+    `;
+
+    wireTabEvents();
+    fillDmgItems();
+    document.getElementById('dmg-brand').onchange = fillDmgItems;
+    document.getElementById('dmg-item').onchange = (e) => {
+      dmgSelItemId = e.target.value;
+      const item = Core.getItem(dmgSelItemId);
+      const stk = document.getElementById('dmg-cur-stk');
+      if (!item) { stk.textContent = ''; return; }
+      const low = item.stock_qty <= item.min_stock && item.min_stock > 0;
+      stk.innerHTML = `Current stock: <b style="color:${low ? 'var(--red)' : 'var(--green)'}">${item.stock_qty} ${esc(item.unit)}</b>${low ? ' ⚠' : ''}`;
+    };
+    document.getElementById('dmg-add-btn').onclick = addToDmgQueue;
+    renderDmgQueue();
+    const submitBtn = document.getElementById('dmg-submit-btn');
+    if (submitBtn) submitBtn.onclick = submitDmgQueue;
+    const clearBtn = document.getElementById('dmg-clear-btn');
+    if (clearBtn) clearBtn.onclick = () => { if (confirm('Clear the batch?')) { dmgQueue = []; render(); } };
+  }
+
+  function fillDmgItems() {
+    const brand = document.getElementById('dmg-brand').value;
+    const sel = document.getElementById('dmg-item');
+    const items = Core.listItems({ location: currentLoc }).filter(i => !brand || (i.brand || 'Unknown Brand') === brand);
+    sel.innerHTML = '<option value="">— Select Item —</option>' + items.map(i =>
+      `<option value="${i.id}">${esc(i.name)} (${esc(i.unit)}) — Stock: ${i.stock_qty}${i.stock_qty <= i.min_stock && i.min_stock > 0 ? ' ⚠' : ''}</option>`).join('');
+    dmgSelItemId = '';
+    document.getElementById('dmg-cur-stk').textContent = '';
+  }
+
+  function addToDmgQueue() {
+    if (!dmgSelItemId) { toast('Select an item'); return; }
+    const qty = Number(document.getElementById('dmg-qty').value);
+    if (!qty || qty <= 0) { toast('Enter a valid quantity'); return; }
+    const entryType = document.getElementById('dmg-type').value;
+    const item = Core.getItem(dmgSelItemId);
+    if (!item) return;
+    if (entryType === 'DAMAGE' && qty > item.stock_qty) { toast(`Not enough stock! Available: ${item.stock_qty}`); return; }
+    const existing = dmgQueue.find(x => x.itemId === dmgSelItemId && x.entryType === entryType);
+    if (existing) existing.qty += qty;
+    else dmgQueue.push({ itemId: dmgSelItemId, qty, entryType, name: item.name, brand: item.brand || '', unit: item.unit });
+    document.getElementById('dmg-qty').value = '';
+    renderDmgQueue();
+    toast('Added to batch');
+  }
+
+  function renderDmgQueue() {
+    const card = document.getElementById('dmg-q-card');
+    const countEl = document.getElementById('dmg-q-count');
+    if (countEl) countEl.textContent = dmgQueue.length;
+    if (!card) return;
+    card.style.display = dmgQueue.length ? 'block' : 'none';
+    if (!dmgQueue.length) return;
+    const wrap = document.getElementById('dmg-q-table');
+    wrap.innerHTML = `
+      <table>
+        <thead><tr><th>Type</th><th>Item</th><th>Brand</th><th>Qty</th><th></th></tr></thead>
+        <tbody>
+          ${dmgQueue.map((x, i) => `
+            <tr>
+              <td><span class="badge ${x.entryType === 'DAMAGE' ? 'lost' : 'confirmed'}">${x.entryType === 'DAMAGE' ? '🔴 DAMAGE' : '🟢 RETURN'}</span></td>
+              <td>${esc(x.name)}</td>
+              <td style="color:var(--navy-700);">${esc(x.brand)}</td>
+              <td style="font-weight:700;">${x.qty} ${esc(x.unit)}</td>
+              <td style="text-align:right;"><button class="btn sm danger dmg-rm-btn" data-idx="${i}">✕</button></td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>
+    `;
+    wrap.querySelectorAll('.dmg-rm-btn').forEach(b => b.onclick = () => { dmgQueue.splice(Number(b.dataset.idx), 1); renderDmgQueue(); });
+  }
+
+  async function submitDmgQueue() {
+    if (!dmgQueue.length) { toast('Batch is empty'); return; }
+    const party_name = document.getElementById('dmg-party').value.trim();
+    const notes = document.getElementById('dmg-note').value.trim();
+    const date = document.getElementById('dmg-date').value || todayStr();
+    const queue = dmgQueue;
+    const failures = [];
+    for (const x of queue) {
+      const result = await Core.recordDamageOrReturn(x.itemId, x.qty, x.entryType, { party_name, notes, date });
+      if (!result.ok) failures.push({ name: x.name, error: result.error });
+    }
+    const submitted = queue.length - failures.length;
+    if (failures.length) {
+      dmgQueue = queue.filter(x => failures.some(f => f.name === x.name));
+      alert(`⚠ ${failures.length} item(s) rejected:\n\n` + failures.map(f => `• ${f.name}: ${f.error}`).join('\n') +
+        (submitted ? `\n\n${submitted} other item(s) submitted successfully.` : ''));
+    } else {
+      dmgQueue = [];
+    }
+    toast(submitted ? `${submitted} item${submitted > 1 ? 's' : ''} submitted` : 'Submission failed');
+    render();
+  }
+
+  /* ---------- TRANSFER: move stock between Godown and Office ---------- */
+
+  function renderTransfer() {
+    const main = document.getElementById('main');
+    const toLoc = currentLoc === 'GODOWN' ? 'OFFICE' : 'GODOWN';
+    const brands = Core.itemBrands(currentLoc);
+    const history = Core.listTransfers().filter(l => {
+      const item = Core.getItem(l.item_id);
+      return item;
+    }).slice(0, 20);
+
+    main.innerHTML = `
+      <div class="page-head">
+        <div>
+          <div class="page-title">Transfer</div>
+          <div class="page-desc">Move stock between Godown and Office. The current location tab (top right) is your "from" side.</div>
+        </div>
+      </div>
+      ${tabsHtml()}
+
+      <div class="card">
+        <div class="card-title">${currentLoc === 'GODOWN' ? '🏭 Godown' : '🏢 Office'} → ${toLoc === 'GODOWN' ? '🏭 Godown' : '🏢 Office'}</div>
+        <div class="field"><label>Brand</label>
+          <select id="tr-brand"><option value="">— All Brands —</option>${brands.map(b => `<option>${esc(b)}</option>`).join('')}</select>
+        </div>
+        <div class="field"><label>Item</label><select id="tr-item"><option value="">— Select Item —</option></select></div>
+        <div class="hint" id="tr-cur-stk" style="margin-bottom:8px;"></div>
+        <div class="field-row">
+          <div class="field"><label>Quantity</label><input id="tr-qty" type="number" min="1"></div>
+          <div class="field"><label>Date</label><input id="tr-date" type="date" value="${todayStr()}"></div>
+        </div>
+        <div class="field"><label>Note (optional)</label><input id="tr-note" placeholder="Reason for transfer"></div>
+        <button class="btn amber" id="tr-submit-btn" style="width:100%; justify-content:center;">🔁 Transfer Stock</button>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Recent Transfers</div>
+        ${history.length ? `
+          <table>
+            <thead><tr><th>Date</th><th>Item</th><th>Qty</th><th>Route</th><th>Note</th></tr></thead>
+            <tbody>
+              ${history.map(l => {
+                const item = Core.getItem(l.item_id);
+                return `<tr>
+                  <td>${fmtDate(l.date)}</td>
+                  <td>${esc(item ? item.name : '?')}</td>
+                  <td style="font-weight:700;">${l.qty}</td>
+                  <td style="font-size:12px;">${esc(l.party_name || '')}</td>
+                  <td style="font-size:12px; color:var(--ink-dim);">${esc(l.notes || '—')}</td>
+                </tr>`;
+              }).join('')}
+            </tbody>
+          </table>
+        ` : `<div class="empty">No transfers yet.</div>`}
+      </div>
+    `;
+
+    wireTabEvents();
+    fillTrItems();
+    document.getElementById('tr-brand').onchange = fillTrItems;
+    document.getElementById('tr-item').onchange = (e) => {
+      trSelItemId = e.target.value;
+      const item = Core.getItem(trSelItemId);
+      const stk = document.getElementById('tr-cur-stk');
+      if (!item) { stk.textContent = ''; return; }
+      const low = item.stock_qty <= item.min_stock && item.min_stock > 0;
+      stk.innerHTML = `Current stock: <b style="color:${low ? 'var(--red)' : 'var(--green)'}">${item.stock_qty} ${esc(item.unit)}</b>${low ? ' ⚠' : ''}`;
+    };
+    document.getElementById('tr-submit-btn').onclick = async () => {
+      if (!trSelItemId) { toast('Select an item'); return; }
+      const qty = Number(document.getElementById('tr-qty').value);
       if (!qty || qty <= 0) { toast('Enter a valid quantity'); return; }
-      Core.stockMove(item_id, type, qty, { ref_type: type === 'in' ? 'purchase' : 'manual', notes: document.getElementById('f-note').value.trim() });
-      closeModal(); toast(`Stock ${type === 'in' ? 'in' : 'out'} recorded`); render();
+      const item = Core.getItem(trSelItemId);
+      if (!confirm(`Transfer ${qty} ${item.unit} of ${item.name} from ${currentLoc} to ${toLoc}?`)) return;
+      const result = await Core.transferStock(trSelItemId, toLoc, qty, document.getElementById('tr-note').value.trim(), document.getElementById('tr-date').value || todayStr());
+      if (!result.ok) { alert(`⚠ Transfer rejected: ${result.error}`); render(); return; }
+      toast(`✅ Transferred ${qty} ${item.unit} to ${toLoc}`);
+      render();
     };
   }
 
-  // clicking any matrix cell or table row opens a quick stock in/out picker
-  document.addEventListener('click', (e) => {
-    const cell = e.target.closest('.wire-cell');
-    if (cell) openQuickStockPicker(cell.dataset.id);
-  });
-  function openQuickStockPicker(item_id) {
-    const item = Core.getItem(item_id);
-    if (!item) return;
-    showModal(item.name, `
-      <div class="hint" style="margin-bottom:12px;">Current stock: <b>${item.stock_qty} ${esc(item.unit)}</b> ${item.min_stock ? `(min ${item.min_stock})` : ''}</div>
-      <div style="display:flex; gap:8px;">
-        <button class="btn amber" id="qp-in" style="flex:1; justify-content:center;">Stock In</button>
-        <button class="btn ghost" id="qp-out" style="flex:1; justify-content:center;">Stock Out</button>
+  function fillTrItems() {
+    const brand = document.getElementById('tr-brand').value;
+    const sel = document.getElementById('tr-item');
+    const items = Core.listItems({ location: currentLoc }).filter(i => !brand || (i.brand || 'Unknown Brand') === brand);
+    sel.innerHTML = '<option value="">— Select Item —</option>' + items.map(i =>
+      `<option value="${i.id}">${esc(i.name)} (${esc(i.unit)}) — Stock: ${i.stock_qty}${i.stock_qty <= i.min_stock && i.min_stock > 0 ? ' ⚠' : ''}</option>`).join('');
+    trSelItemId = '';
+    document.getElementById('tr-cur-stk').textContent = '';
+  }
+
+  function todayStr() { return new Date().toISOString().slice(0, 10); }
+
+  /* ---------- PARTY MASTER: dedicated party list with role/phone editing ---------- */
+
+  function renderPartyMaster() {
+    const main = document.getElementById('main');
+    const ledgerParties = Core.listParties({}).filter(p => p.role || p.type === 'supplier');
+
+    main.innerHTML = `
+      <div class="page-head">
+        <div>
+          <div class="page-title">Party Master</div>
+          <div class="page-desc">Suppliers and customers used across Stock In/Out. New parties are also added automatically when you type a new name there.</div>
+        </div>
+        <button class="btn amber" id="btn-add-pm">+ Add Party</button>
       </div>
+      ${tabsHtml()}
+      <div class="card">
+        <div class="card-title">Parties (${ledgerParties.length})</div>
+        ${ledgerParties.length ? `
+          <table>
+            <thead><tr><th>Name</th><th>Role</th><th>Phone</th><th></th></tr></thead>
+            <tbody>
+              ${ledgerParties.map(p => `
+                <tr>
+                  <td><b>${esc(p.name)}</b></td>
+                  <td><span class="badge ${p.role === 'SUPPLIER' ? 'new' : p.role === 'BOTH' ? 'agreed' : 'confirmed'}">${esc(p.role || '—')}</span></td>
+                  <td>${esc(p.phone) || '—'}</td>
+                  <td style="text-align:right;"><button class="btn sm ghost pm-edit-btn" data-id="${p.id}">Edit</button></td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        ` : `<div class="empty">No parties yet. They're added automatically the first time you use a name in Stock In/Out.</div>`}
+      </div>
+    `;
+    wireTabEvents();
+    document.getElementById('btn-add-pm').onclick = () => openPmForm(null);
+    document.querySelectorAll('.pm-edit-btn').forEach(b => b.onclick = () => openPmForm(b.dataset.id));
+  }
+
+  function openPmForm(id) {
+    const p = id ? Core.getParty(id) : null;
+    showModal(id ? 'Edit Party' : 'Add Party', `
+      <div class="field"><label>Name *</label><input id="pm-name" value="${p ? esc(p.name) : ''}"></div>
+      <div class="field"><label>Role</label>
+        <select id="pm-role">
+          <option value="SUPPLIER" ${p && p.role === 'SUPPLIER' ? 'selected' : ''}>Supplier</option>
+          <option value="CUSTOMER" ${p && p.role === 'CUSTOMER' ? 'selected' : ''}>Customer</option>
+          <option value="BOTH" ${p && p.role === 'BOTH' ? 'selected' : ''}>Both</option>
+        </select>
+      </div>
+      <div class="field"><label>Phone</label><input id="pm-phone" value="${p ? esc(p.phone || '') : ''}"></div>
+      <button class="btn amber" id="pm-save" style="width:100%; justify-content:center;">Save</button>
     `);
-    document.getElementById('qp-in').onclick = () => openStockModal(item_id, 'in');
-    document.getElementById('qp-out').onclick = () => openStockModal(item_id, 'out');
+    document.getElementById('pm-save').onclick = () => {
+      const name = document.getElementById('pm-name').value.trim();
+      if (!name) { toast('Name required'); return; }
+      const role = document.getElementById('pm-role').value;
+      const phone = document.getElementById('pm-phone').value.trim();
+      if (id) Core.updateParty(id, { name, role, phone });
+      else Core.addParty({ name, phone, type: 'supplier', role, status: 'Closed' });
+      closeModal(); toast('Saved'); render();
+    };
+  }
+
+  /* ---------- PARTY LEDGER: raw transaction history for one party ---------- */
+
+  function renderPartyLedgerView() {
+    const main = document.getElementById('main');
+    const names = Core.ledgerPartyNames();
+
+    main.innerHTML = `
+      <div class="page-head">
+        <div>
+          <div class="page-title">Party Ledger</div>
+          <div class="page-desc">Full stock in/out history for a single party.</div>
+        </div>
+      </div>
+      ${tabsHtml()}
+      <div class="card" style="padding-bottom:10px;">
+        <div class="field-row">
+          <div class="field"><label>Party</label>
+            <select id="pl-party"><option value="">— Select Party —</option>${names.map(n => `<option>${esc(n)}</option>`).join('')}</select>
+          </div>
+          <div class="field"><label>Type</label>
+            <select id="pl-type"><option value="">Both</option><option value="IN">IN only</option><option value="OUT">OUT only</option></select>
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field"><label>From</label><input id="pl-from" type="date"></div>
+          <div class="field"><label>To</label><input id="pl-to" type="date"></div>
+        </div>
+      </div>
+      <div id="pl-summary" class="stat-row"></div>
+      <div class="card"><div id="pl-table"><div class="empty">Select a party to view ledger</div></div></div>
+    `;
+    wireTabEvents();
+    ['pl-party', 'pl-type', 'pl-from', 'pl-to'].forEach(id => document.getElementById(id).onchange = renderPlTable);
+  }
+
+  function renderPlTable() {
+    const party = document.getElementById('pl-party').value;
+    const type = document.getElementById('pl-type').value;
+    const from = document.getElementById('pl-from').value;
+    const to = document.getElementById('pl-to').value;
+    const tbl = document.getElementById('pl-table');
+    const sum = document.getElementById('pl-summary');
+    if (!party) { tbl.innerHTML = `<div class="empty">Select a party to view ledger</div>`; sum.innerHTML = ''; return; }
+
+    const list = Core.partyLedger(party, { type, from, to });
+    const inQty = list.filter(l => l.type === 'in').reduce((s, l) => s + l.qty, 0);
+    const outQty = list.filter(l => l.type === 'out').reduce((s, l) => s + l.qty, 0);
+    sum.innerHTML = `
+      <div class="stat"><div class="stat-num" style="font-size:16px;">${esc(party)}</div><div class="stat-label">Party</div></div>
+      <div class="stat"><div class="stat-num" style="color:var(--green);">${inQty}</div><div class="stat-label">Total IN</div></div>
+      <div class="stat"><div class="stat-num" style="color:#e65100;">${outQty}</div><div class="stat-label">Total OUT</div></div>
+      <div class="stat"><div class="stat-num">${list.length}</div><div class="stat-label">Transactions</div></div>
+    `;
+    if (!list.length) { tbl.innerHTML = `<div class="empty">No transactions found for this party.</div>`; return; }
+    tbl.innerHTML = `
+      <table>
+        <thead><tr><th>Date</th><th>Type</th><th>Item</th><th>Brand</th><th>Qty</th><th>Ref</th><th>By</th></tr></thead>
+        <tbody>
+          ${list.map(l => {
+            const item = Core.getItem(l.item_id);
+            const dispNote = (l.notes || '').split(' | Remark: ')[0] || '—';
+            return `<tr>
+              <td>${fmtDate(l.date)}</td>
+              <td><span class="badge ${l.type === 'in' ? 'confirmed' : 'quoted'}">${l.type.toUpperCase()}</span></td>
+              <td style="font-weight:600;">${esc(item ? item.name : '?')}</td>
+              <td style="color:var(--navy-700);">${esc(item ? item.brand || '—' : '—')}</td>
+              <td style="font-weight:700; color:${l.type === 'in' ? 'var(--green)' : '#e65100'};">${l.type === 'in' ? '+' : '-'}${l.qty} ${esc(item ? item.unit : '')}</td>
+              <td style="font-size:12px;">${esc(dispNote)}</td>
+              <td>${l.operator ? `<span class="badge new">${esc(l.operator)}</span>` : '—'}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>
+    `;
+  }
+
+  /* ---------- SUPPLIER / CUSTOMER LEDGER: bill-grouped with paid status ---------- */
+
+  function renderRoleLedger(role) {
+    const main = document.getElementById('main');
+    const isSupplier = role === 'SUPPLIER';
+    const bills = (isSupplier ? Core.supplierLedgerBills() : Core.customerLedgerBills()).sort((a, b) => b.date.localeCompare(a.date));
+    const statusMeta = {
+      paid: ['✅ Paid', 'confirmed'], 'no-credit': ['— No Credit', 'draft'],
+      overdue: ['🔴 Overdue', 'lost'], 'due-soon': ['🟡 Due Soon', 'priced'], 'not-due': ['🔵 Not Due', 'new']
+    };
+    const overdueCount = bills.filter(b => Core.billStatus(b) === 'overdue').length;
+
+    main.innerHTML = `
+      <div class="page-head">
+        <div>
+          <div class="page-title">${isSupplier ? 'Supplier' : 'Customer'} Ledger</div>
+          <div class="page-desc">Bills grouped by party, reference and date — with credit-day maturity tracking.</div>
+        </div>
+      </div>
+      ${tabsHtml()}
+      <div class="stat-row">
+        <div class="stat"><div class="stat-num">${bills.length}</div><div class="stat-label">Total Bills</div></div>
+        <div class="stat"><div class="stat-num" style="color:${overdueCount ? 'var(--red)' : 'inherit'}">${overdueCount}</div><div class="stat-label">Overdue</div></div>
+        <div class="stat"><div class="stat-num">${bills.filter(b => Core.billStatus(b) === 'paid').length}</div><div class="stat-label">Paid</div></div>
+      </div>
+      <div class="card">
+        <div class="card-title">Bills</div>
+        ${bills.length ? bills.map(b => {
+          const status = Core.billStatus(b);
+          const [label, cls] = statusMeta[status];
+          const mat = b.creditDays ? Core.calcMaturityDate(b.date, b.creditDays) : null;
+          return `
+            <div style="padding:12px 0; border-bottom:1px solid var(--paper-dim);">
+              <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:8px; flex-wrap:wrap;">
+                <div>
+                  <b>${esc(b.party)}</b> <span class="badge ${cls}">${label}</span>
+                  <div style="font-size:12px; color:var(--ink-dim); margin-top:2px;">${b.billNo ? 'Ref: ' + esc(b.billNo) + ' · ' : ''}${fmtDate(b.date)}${mat ? ' · Due ' + fmtDate(mat) : ''}${b.creditDays ? ' (' + b.creditDays + 'd credit)' : ''}</div>
+                </div>
+                <button class="btn sm ${b.paid ? 'ghost' : 'amber'} bill-pay-btn" data-key="${encodeURIComponent(b.key)}">${b.paid ? 'Mark Unpaid' : 'Mark Paid'}</button>
+              </div>
+              <div style="font-size:12px; color:var(--ink-dim); margin-top:6px;">${b.rows.map(r => `${esc(r.name)} (${r.qty} ${esc(r.unit)})`).join(', ')}</div>
+            </div>
+          `;
+        }).join('') : `<div class="empty">No ${isSupplier ? 'purchase' : 'sale'} bills yet.</div>`}
+      </div>
+    `;
+    wireTabEvents();
+    document.querySelectorAll('.bill-pay-btn').forEach(b => b.onclick = () => {
+      Core.toggleBillPaid(decodeURIComponent(b.dataset.key));
+      toast('Updated'); renderRoleLedger(role);
+    });
+  }
+
+  /* ---------- PIPE STOCK: standalone report, pure pipes only (no bends/flexible) ---------- */
+
+  function renderPipeStock() {
+    const main = document.getElementById('main');
+    const brands = Array.from(new Set(Core.listItems({ location: currentLoc }).filter(Core.isPurePipe).map(i => i.brand || 'Unknown Brand'))).sort();
+
+    main.innerHTML = `
+      <div class="page-head">
+        <div>
+          <div class="page-title">Pipe Stock</div>
+          <div class="page-desc">Pure pipes only — bends and flexible fittings are excluded from this report.</div>
+        </div>
+      </div>
+      ${tabsHtml()}
+      <div class="card" style="padding-bottom:10px;">
+        <label>Select Brand</label>
+        <select id="pc-brand">
+          <option value="">— Choose a brand —</option>
+          ${brands.map(b => `<option value="${esc(b)}">${esc(b)}</option>`).join('')}
+        </select>
+      </div>
+      <div id="pc-summary" class="stat-row"></div>
+      <div class="card" style="padding:0; overflow:hidden;"><div id="pc-table"></div></div>
+    `;
+    wireTabEvents();
+    document.getElementById('pc-brand').onchange = renderPcTable;
+  }
+
+  function renderPcTable() {
+    const brand = document.getElementById('pc-brand').value;
+    const sum = document.getElementById('pc-summary');
+    const tbl = document.getElementById('pc-table');
+    if (!brand) { sum.innerHTML = ''; tbl.innerHTML = ''; return; }
+
+    const pipes = Core.listItems({ location: currentLoc }).filter(i => (i.brand || 'Unknown Brand') === brand && Core.isPurePipe(i)).sort((a, b) => a.name.localeCompare(b.name));
+    if (!pipes.length) { sum.innerHTML = ''; tbl.innerHTML = `<div class="empty">No pipe items found for this brand.</div>`; return; }
+
+    const low = pipes.filter(i => i.stock_qty <= i.min_stock && i.min_stock > 0);
+    sum.innerHTML = `
+      <div class="stat"><div class="stat-num" style="font-size:16px; color:#2e7d32;">${esc(brand)}</div><div class="stat-label">Brand</div></div>
+      <div class="stat"><div class="stat-num">${pipes.length}</div><div class="stat-label">Total Pipes</div></div>
+      <div class="stat"><div class="stat-num" style="color:var(--green);">${pipes.length - low.length}</div><div class="stat-label">OK Stock</div></div>
+      <div class="stat"><div class="stat-num" style="color:${low.length ? 'var(--red)' : 'inherit'}">${low.length}</div><div class="stat-label">Low Stock</div></div>
+    `;
+    tbl.innerHTML = `
+      <table style="border-collapse:collapse; width:100%; font-size:13px;"><thead><tr>
+        <th style="background:#2e7d32; color:#fff; padding:10px 16px; text-align:left; border:1px solid #388e3c;">Pipe Name</th>
+        <th style="background:#2e7d32; color:#fff; padding:10px 16px; text-align:center; border:1px solid #388e3c;">Stock</th>
+        <th style="background:#2e7d32; color:#fff; padding:10px 16px; text-align:center; border:1px solid #388e3c;">Unit</th>
+        <th style="background:#2e7d32; color:#fff; padding:10px 16px; text-align:center; border:1px solid #388e3c;">Min</th>
+        <th style="background:#2e7d32; color:#fff; padding:10px 16px; text-align:center; border:1px solid #388e3c;">Status</th>
+      </tr></thead><tbody>
+        ${pipes.map((i, idx) => {
+          const isLow = i.stock_qty <= i.min_stock && i.min_stock > 0;
+          return `<tr style="background:${isLow ? '#fff8f8' : (idx % 2 === 0 ? '#fff' : '#f1f8e9')};">
+            <td style="padding:11px 16px; border:1px solid #dcedc8; font-weight:600; color:#1b5e20;">${esc(i.name)}</td>
+            <td style="padding:11px 16px; border:1px solid #dcedc8; text-align:center;"><span style="font-size:22px; font-weight:800; color:${isLow ? 'var(--red)' : 'var(--green)'};">${i.stock_qty}</span></td>
+            <td style="padding:11px 16px; border:1px solid #dcedc8; text-align:center; font-size:12px; color:#555;">${esc(i.unit)}</td>
+            <td style="padding:11px 16px; border:1px solid #dcedc8; text-align:center; font-size:12px; color:#888;">${i.min_stock}</td>
+            <td style="padding:11px 16px; border:1px solid #dcedc8; text-align:center;"><span class="badge ${isLow ? 'low' : 'confirmed'}">${isLow ? '⚠ LOW' : '✓ OK'}</span></td>
+          </tr>`;
+        }).join('')}
+      </tbody></table>
+    `;
   }
 
   return { render };
@@ -1955,8 +2995,14 @@ const Quotation = (() => {
     document.getElementById('btn-new-indent').onclick = openIndentModal;
     document.querySelectorAll('.price-btn').forEach(b => b.onclick = () => openPricingModal(b.dataset.id));
     document.querySelectorAll('.gen-btn').forEach(b => b.onclick = () => openGenerateModal(b.dataset.id));
-    document.querySelectorAll('.confirm-btn').forEach(b => b.onclick = () => {
-      Core.confirmQuotation(b.dataset.id);
+    document.querySelectorAll('.confirm-btn').forEach(b => b.onclick = async () => {
+      b.disabled = true; b.textContent = 'Confirming…';
+      const result = await Core.confirmQuotation(b.dataset.id);
+      if (!result.ok) {
+        alert(`⚠ Could not confirm — stock unavailable for:\n\n` + result.failures.map(f => `• ${f.name}: ${f.error}`).join('\n'));
+        render();
+        return;
+      }
       toast('Sale confirmed — stock deducted, party updated');
       render();
     });
@@ -1995,7 +3041,7 @@ const Quotation = (() => {
       <button class="btn amber" id="save-indent" style="width:100%; justify-content:center; margin-top:10px;">Raise Indent</button>
     `);
 
-    const items_opts = items.map(i => `<option value="${i.id}">${esc(i.name)}</option>`).join('');
+    const items_opts = items.map(i => `<option value="${i.id}">${esc(i.name)} — ${i.location === 'OFFICE' ? '🏢 Office' : '🏭 Godown'} (${i.stock_qty} ${esc(i.unit)})</option>`).join('');
 
     function renderLines() {
       document.getElementById('indent-lines').innerHTML = indentLines.map((l, idx) => `
@@ -2057,11 +3103,19 @@ const Quotation = (() => {
       <div class="hint" style="margin-bottom:10px;">Total: ₹${priced.reduce((s, l) => s + l.amount, 0).toFixed(2)}</div>
       <button class="btn amber" id="gen-doc" style="width:100%; justify-content:center;">Generate</button>
     `);
-    document.getElementById('gen-doc').onclick = () => {
+    document.getElementById('gen-doc').onclick = async () => {
+      const genBtn = document.getElementById('gen-doc');
+      genBtn.disabled = true; genBtn.textContent = 'Generating…';
       const doc_type = document.getElementById('f-doctype').value;
-      const q = Core.createQuotation(indent_id, doc_type, priced);
+      const { quotation: q, confirmResult } = await Core.createQuotation(indent_id, doc_type, priced);
       closeModal();
-      toast(doc_type === 'CB' ? `${q.doc_no} confirmed — stock deducted` : `${q.doc_no} created — awaiting confirmation`);
+      if (doc_type === 'CB' && !confirmResult.ok) {
+        alert(`${q.doc_no} was created but could NOT confirm — stock unavailable for:\n\n` +
+          confirmResult.failures.map(f => `• ${f.name}: ${f.error}`).join('\n') +
+          `\n\nIt's saved as a pending Cash Bill — fix stock and confirm it from the Documents list.`);
+      } else {
+        toast(doc_type === 'CB' ? `${q.doc_no} confirmed — stock deducted` : `${q.doc_no} created — awaiting confirmation`);
+      }
       render();
     };
   }

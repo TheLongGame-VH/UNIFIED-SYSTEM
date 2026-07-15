@@ -1914,12 +1914,24 @@ const Inventory = (() => {
 
     const wireItems = items.filter(Core.isWire);
     const pipeItems = items.filter(i => Core.isPipe(i));
+    // wires that DO end in a known colour go in the matrix; wires that
+    // don't (e.g. "...WIRE (KEI FR)" — a grade, not a colour) must still
+    // show up somewhere instead of silently disappearing.
+    const coloredWireItems = wireItems.filter(i => Core.WIRE_COLORS.some(c => i.name.toUpperCase().endsWith(' ' + c)));
+    const plainWireItems = wireItems.filter(i => !Core.WIRE_COLORS.some(c => i.name.toUpperCase().endsWith(' ' + c)));
     const otherItems = items.filter(i => !Core.isWire(i) && !Core.isPipe(i));
 
     let html = `<div class="card" style="padding:0; overflow:hidden;">`;
-    if (wireItems.length) html += wireMatrixHtml(wireItems);
+    if (coloredWireItems.length) html += wireMatrixHtml(coloredWireItems);
     if (pipeItems.length) html += pipeMatrixHtml(pipeItems);
     html += `</div>`;
+
+    if (plainWireItems.length) {
+      html += `<div class="card" style="padding:0; overflow:hidden; margin-top:12px;">
+        <div style="font-size:13px; font-weight:700; color:#185FA5; padding:10px 16px; background:#e8f0fb; border-bottom:1px solid #d0ddf5;">🔌 Other Wires &amp; Cables</div>
+        ${plainItemTable(plainWireItems.sort((a, b) => a.name.localeCompare(b.name)))}
+      </div>`;
+    }
 
     if (otherItems.length) {
       const byCat = {};

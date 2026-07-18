@@ -289,7 +289,10 @@ const Core = (() => {
       stock_ledger: [],  // {id,item_id,type,qty,ref_type,ref_id,party_id,date,notes}
       activity: [],      // {id,party_id,type,note,date}  -- lightweight timeline entries
       calls: [],         // {id,party_id,outcome,notes,date,lat,lng}
-      diary_stops: []    // {id,date,label,notes,address,lat,lng,ts,type} type: start|stop|end
+      diary_stops: [],   // {id,date,label,notes,address,lat,lng,ts,type} type: start|stop|end
+      price_catalog: []  // {id,brand,name,mrp,hsn} — Quotation's own sell-price catalog,
+                          // deliberately separate from Inventory's stock items: a brand/item
+                          // can be quotable at a known MRP without being tracked stock.
     };
   }
 
@@ -473,6 +476,131 @@ const Core = (() => {
   }
   function diaryDates() {
     return Array.from(new Set(db.diary_stops.map(s => s.date))).sort().reverse();
+  }
+
+  /* ---------- PRICE CATALOG (Quotation's own brand/item/MRP list) ---------- */
+
+  function addCatalogItem({ brand, name, mrp = 0, hsn = '' }) {
+    if (!brand || !name) throw new Error('Brand and item name are required');
+    const item = { id: uid('cat'), brand: brand.trim(), name: name.trim(), mrp: Number(mrp) || 0, hsn: hsn.trim() };
+    db.price_catalog.push(item);
+    persist();
+    return item;
+  }
+  function updateCatalogItem(id, fields) {
+    const item = db.price_catalog.find(i => i.id === id);
+    if (!item) return;
+    Object.assign(item, fields);
+    persist();
+    return item;
+  }
+  function deleteCatalogItem(id) {
+    db.price_catalog = db.price_catalog.filter(i => i.id !== id);
+    persist();
+  }
+  function catalogBrands() {
+    return Array.from(new Set(db.price_catalog.map(i => i.brand))).sort();
+  }
+  function catalogItemsForBrand(brand) {
+    return db.price_catalog.filter(i => i.brand === brand).sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  /* ---------- pricing classification — brand-agnostic, driven by item NAME ----------
+     Matches the original exactly: any brand automatically gets coil/colour/FR
+     treatment as long as its item names follow the normal convention. */
+  function getCoilLength(itemName) {
+    const n = (itemName || '').toUpperCase();
+    if (n.includes('90MTR')) return 90;
+    if (n.includes('180MTR')) return 180;
+    if (n.includes('200MTR')) return 200;
+    if (n.includes('300MTR')) return 300;
+    const m = n.match(/(\d{2,4})\s*MTR\b/);
+    return m ? parseInt(m[1], 10) : null;
+  }
+  function isWireOrCableItemName(name) {
+    const n = (name || '').toUpperCase();
+    return /SQMM/.test(n) || /\bWIRE\b/.test(n) || /\bCABLE\b/.test(n);
+  }
+  function isArmouredOrFlexibleItemName(name) {
+    const n = (name || '').toUpperCase();
+    return /ARMOURED|FLEXIBLE/.test(n);
+  }
+  function getDisplayBrand(b) {
+    if (!b) return b;
+    if (b.startsWith('POLYCAB')) return 'POLYCAB';
+    if (b.startsWith('KEI')) return 'KEI';
+    return b.split(' - ')[0].trim();
+  }
+  function getHSN(brand, itemName) {
+    const n = (itemName || '').toUpperCase();
+    if (isWireOrCableItemName(itemName)) return '85446090';
+    if (n.includes('SWITCH') || n.includes('SOCKET') || n.includes('REGULATOR') || n.includes('BELL PUSH') || n.includes('INDICATOR')) return '85365020';
+    if (n.includes('MCB') || n.includes('MCCB') || n.includes('ISOLAT')) return '85362000';
+    if (n.includes(' DB ') || n.endsWith('DB') || n.includes('PANEL') || n.includes('ENCLOSER')) return '85371000';
+    if (n.includes('MODULE PLATE') || n.includes('BLANK PLATE') || n.includes(' PLATE')) return '85389000';
+    if (n.includes('DOWN LIGHT') || n.includes('SKIRTING LIGHT') || n.includes('FOOT LAMP')) return '94051090';
+    if (n.includes('RJ') || n.includes('TV SOCKET') || n.includes('TELEPHONE') || n.includes('USB')) return '85363090';
+    return '85369090';
+  }
+  const WIRE_COLOUR_STYLES = {
+    RED: 'background:#fff0f0;color:#c62828;font-weight:700', YELLOW: 'background:#fffde7;color:#f57f17;font-weight:700',
+    BLUE: 'background:#e3f2fd;color:#1565c0;font-weight:700', BLACK: 'background:#f5f5f5;color:#212121;font-weight:700',
+    GREEN: 'background:#e8f5e9;color:#2e7d32;font-weight:700'
+  };
+  function getColourStyle(colour) { return WIRE_COLOUR_STYLES[(colour || '').toUpperCase()] || 'background:#f3e5f5;color:#6a1b9a;font-weight:700'; }
+
+  /** Computes every derived field for one quotation line the exact way the
+   *  original's addItem() does: coil-priced wire (MRP ÷ coil length),
+   *  armoured/flexible (priced per metre already), or a plain item. */
+  function computeQuotationLine({ brand, itemName, mrp, unit, discPct, netOverride, qty, coilLenOverride, frType, colour, hsn: hsnOverride }) {
+    const coilMRP = Number(mrp) || 0;
+    const displayBrand = getDisplayBrand(brand);
+    const coilLenDetected = getCoilLength(itemName);
+    const isWireItem = isWireOrCableItemName(itemName);
+    const isIndCopper = isWireItem && !!coilLenDetected;
+    const isArmFlx = isWireItem && !coilLenDetected;
+    const buildSuffix = base => frType ? `${base} ${frType}` : base;
+    let perMtrRate = '-', displayUnit, displayMRP, description, showPerMtr = false, finalRate;
+    const finalQty = Number(qty) || 0;
+
+    if (isIndCopper) {
+      const len = Number(coilLenOverride) || coilLenDetected || 1;
+      let coilRate = netOverride ? Number(netOverride) : (discPct ? coilMRP - (coilMRP * Number(discPct) / 100) : coilMRP);
+      perMtrRate = (coilRate / len).toFixed(2);
+      description = buildSuffix(itemName);
+      if (unit === 'MTRS') { displayUnit = 'MTRS'; displayMRP = (coilMRP / len).toFixed(2); showPerMtr = false; finalRate = +perMtrRate; }
+      else { displayUnit = 'COIL'; displayMRP = coilMRP; showPerMtr = true; finalRate = coilRate; }
+    } else if (isArmFlx) {
+      let coilRate = netOverride ? Number(netOverride) : (discPct ? coilMRP - (coilMRP * Number(discPct) / 100) : coilMRP);
+      perMtrRate = '-'; displayUnit = 'MTRS'; displayMRP = coilMRP; showPerMtr = false; description = buildSuffix(itemName); finalRate = coilRate;
+    } else {
+      let coilRate = netOverride ? Number(netOverride) : (discPct ? coilMRP - (coilMRP * Number(discPct) / 100) : coilMRP);
+      perMtrRate = '-'; displayUnit = unit; displayMRP = coilMRP; showPerMtr = false; description = itemName; finalRate = coilRate;
+    }
+    const colourCell = (isIndCopper || isArmFlx) ? (colour || '—') : '-';
+    const hsn = hsnOverride || getHSN(brand, itemName);
+    const amount = +(finalRate * finalQty).toFixed(2);
+    return {
+      brand: displayBrand, description, colour: colourCell, hsn, unit: displayUnit,
+      qty: finalQty, mrp: displayMRP, discount: discPct || 0, rate: +finalRate.toFixed(2),
+      perMtr: perMtrRate, showPerMtr, amount, coilLen: isIndCopper ? (Number(coilLenOverride) || coilLenDetected || 1) : null,
+      isWireItem, isIndCopper, isArmFlx
+    };
+  }
+
+  /* ---------- per-brand MRP visibility — local device setting, matches original ---------- */
+  function getBrandMrpVisibility() {
+    try { return JSON.parse(localStorage.getItem('SSE_BRAND_MRP_VIS') || '{}'); } catch (e) { return {}; }
+  }
+  function setBrandMrpVisibility(map) {
+    localStorage.setItem('SSE_BRAND_MRP_VIS', JSON.stringify(map));
+  }
+  function isBrandMrpVisible(brand, masterOn) {
+    if (!masterOn) return false;
+    const vis = getBrandMrpVisibility();
+    brand = (brand || '').trim();
+    if (Object.prototype.hasOwnProperty.call(vis, brand)) return !!vis[brand];
+    return true;
   }
 
   /* ---------- ITEMS (Inventory master + pricing, shared by Quotation) ----------
@@ -763,11 +891,50 @@ const Core = (() => {
 
   /* ---------- QUOTATIONS ---------- */
 
-  function nextDocNo(doc_type) {
-    const count = db.quotations.filter(q => q.doc_type === doc_type).length + 1;
-    const prefix = { QTN: 'QTN', CB: 'CB', PI: 'PI' }[doc_type] || 'DOC';
-    const yr = new Date().getFullYear();
-    return `${prefix}-${yr}-${String(count).padStart(3, '0')}`;
+  /* ---------- Document numbering — matches original exactly:
+     SGE-SSE-{TYPE}-{serial padded 3}/{FY label}/{CUSTOMER NAME}
+     Serial is per-party + per-doc-type + per-financial-year, starting from
+     DOC_SERIAL_START (PI starts its own series at 100). A save retries up
+     to 20 times on a doc_no collision (two people saving at once) — same
+     server-verified pattern as stock moves. */
+  const DOC_SERIAL_START = { QTN: 1, CB: 1, PI: 100 };
+
+  function getFinancialYear(dateObj) {
+    const y = dateObj.getFullYear(), m = dateObj.getMonth() + 1;
+    const startYear = (m >= 4) ? y : y - 1;
+    const endYear = startYear + 1;
+    const pad2 = n => String(n).slice(-2);
+    return { label: `${pad2(startYear)}-${pad2(endYear)}`, startStr: `${startYear}-04-01`, endExclusiveStr: `${endYear}-04-01` };
+  }
+
+  function nextDocSerialLocal(partyId, docType, fy) {
+    const count = db.quotations.filter(q => q.party_id === partyId && q.doc_type === docType &&
+      q.date.slice(0, 10) >= fy.startStr && q.date.slice(0, 10) < fy.endExclusiveStr).length;
+    return (DOC_SERIAL_START[docType] || 1) + count;
+  }
+
+  /** Builds the doc number and inserts the quotation, retrying with the next
+   *  serial if Supabase rejects it as a duplicate (requires a UNIQUE
+   *  constraint on doc_no — see supabase-quotation-setup.sql). Falls back to
+   *  a single local-only assignment if cloud sync isn't connected. */
+  async function assignDocNoAndSave(quotation, isCmp) {
+    const party = getParty(quotation.party_id);
+    const custName = (party ? (party.company || party.name) : 'CUSTOMER').trim().toUpperCase();
+    const dateObj = new Date(quotation.date || now());
+    const fy = getFinancialYear(dateObj);
+    let serial = nextDocSerialLocal(quotation.party_id, quotation.doc_type, fy);
+    let lastError = null;
+    for (let attempt = 0; attempt < 20; attempt++) {
+      const docNo = `SGE-SSE-${quotation.doc_type}${isCmp ? '-CMP' : ''}-${String(serial + attempt).padStart(3, '0')}/${fy.label}/${custName}`;
+      quotation.doc_no = docNo;
+      if (!cloud.enabled) return { ok: true }; // offline/local-only: no collision possible to check against
+      const result = await cloud.pushRowVerified('quotations', quotation);
+      if (result.ok) return { ok: true };
+      lastError = result.error;
+      if (!/doc_no/i.test(result.error || '')) return { ok: false, error: result.error };
+      // duplicate doc_no — loop and try the next serial
+    }
+    return { ok: false, error: lastError || 'Could not assign a unique document number after 20 attempts.' };
   }
 
   async function createQuotation(indent_id, doc_type, pricedLines) {
@@ -776,9 +943,12 @@ const Core = (() => {
     const total = +pricedLines.reduce((s, l) => s + l.amount, 0).toFixed(2);
     const quotation = {
       id: uid('quo'), indent_id, party_id: indent.party_id, doc_type,
-      doc_no: nextDocNo(doc_type), date: now(), lines: pricedLines, total,
+      doc_no: '(assigning…)', date: now(), lines: pricedLines, total,
       status: 'draft', created_at: now(), confirmed_at: null
     };
+    const numberResult = await assignDocNoAndSave(quotation, false);
+    if (!numberResult.ok) return { ok: false, error: numberResult.error };
+
     db.quotations.push(quotation);
     indent.status = 'quoted';
     logActivity(indent.party_id, 'quotation', `${doc_type} ${quotation.doc_no} created — ₹${total}`);
@@ -843,7 +1013,7 @@ const Core = (() => {
      to Supabase (upsert). On load and every 20s, pull all tables down and
      merge in anything from other devices. Simple, not clever — fine for a
      handful of users on a small dataset. */
-  const TABLES = ['parties', 'items', 'indents', 'quotations', 'stock_ledger', 'activity', 'calls', 'diary_stops'];
+  const TABLES = ['parties', 'items', 'indents', 'quotations', 'stock_ledger', 'activity', 'calls', 'diary_stops', 'price_catalog'];
   // Baked-in defaults so every device auto-connects with zero setup.
   // Safe to have in client-side code — this is a publishable/anon key,
   // meant to be public; real protection comes from Row Level Security
@@ -902,15 +1072,14 @@ const Core = (() => {
       document.dispatchEvent(new CustomEvent('core:sync'));
     },
 
-    /** Pushes a single stock_ledger row and waits for Postgres to accept or
-     *  reject it (via the negative-stock guard trigger). Returns
-     *  {ok:true} on success, {ok:true, offline:true} if unreachable
-     *  (accepted optimistically, will sync later), or {ok:false, error}
-     *  if the server actively rejected the move. */
-    async pushLedgerRowVerified(row) {
+    /** Pushes a single row to any table and waits for Postgres to accept or
+     *  reject it. Returns {ok:true} on success, {ok:true, offline:true} if
+     *  unreachable (accepted optimistically, will sync later), or
+     *  {ok:false, error} if the server actively rejected the row. */
+    async pushRowVerified(table, row) {
       if (!this.enabled) return { ok: true };
       try {
-        const res = await fetch(`${this.url}/rest/v1/stock_ledger`, {
+        const res = await fetch(`${this.url}/rest/v1/${table}`, {
           method: 'POST',
           headers: Object.assign(this.headers(), { 'Prefer': 'return=minimal' }),
           body: JSON.stringify([row])
@@ -924,6 +1093,8 @@ const Core = (() => {
         return { ok: true, offline: true };
       }
     },
+
+    async pushLedgerRowVerified(row) { return this.pushRowVerified('stock_ledger', row); },
 
     pushDirty() { TABLES.forEach(t => this.pushTable(t)); },
 
@@ -979,6 +1150,12 @@ const Core = (() => {
     addCall, listCalls, deleteCall,
     // diary
     getDiaryStops, addDiaryStop, deleteDiaryStop, diaryDates,
+    // price catalog
+    addCatalogItem, updateCatalogItem, deleteCatalogItem, catalogBrands, catalogItemsForBrand,
+    // pricing helpers
+    getCoilLength, isWireOrCableItemName, isArmouredOrFlexibleItemName, getDisplayBrand, getHSN,
+    getColourStyle, computeQuotationLine, getBrandMrpVisibility, setBrandMrpVisibility, isBrandMrpVisible,
+    getFinancialYear,
     // items
     addItem, getItem, listItems, updateItemPrice,
     WIRE_COLORS, PIPE_SIZES, CS_BG, CS_TX, isWire, isPipe, isPurePipe, baseName, getPipeSize, itemBrands,
@@ -3501,7 +3678,13 @@ const Quotation = (() => {
       const genBtn = document.getElementById('gen-doc');
       genBtn.disabled = true; genBtn.textContent = 'Generating…';
       const doc_type = document.getElementById('f-doctype').value;
-      const { quotation: q, confirmResult } = await Core.createQuotation(indent_id, doc_type, priced);
+      const genResult = await Core.createQuotation(indent_id, doc_type, priced);
+      if (genResult.ok === false) {
+        closeModal();
+        alert(`⚠ Could not generate the document number: ${genResult.error}\n\nNothing was saved — try again.`);
+        return;
+      }
+      const { quotation: q, confirmResult } = genResult;
       closeModal();
       if (doc_type === 'CB' && !confirmResult.ok) {
         alert(`${q.doc_no} was created but could NOT confirm — stock unavailable for:\n\n` +

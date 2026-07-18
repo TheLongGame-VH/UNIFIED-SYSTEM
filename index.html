@@ -1826,20 +1826,33 @@ const Inventory = (() => {
     if (view === 'supplierledger') { renderRoleLedger('SUPPLIER'); return; }
     if (view === 'customerledger') { renderRoleLedger('CUSTOMER'); return; }
     if (view === 'pipestock') { renderPipeStock(); return; }
+    if (view === 'dashboard') { renderInvDashboard(); return; }
+    if (view === 'alerts') { renderAlerts(); return; }
+    if (view === 'history') { renderHistory(); return; }
+    if (view === 'fastmoving') { renderFastMoving(); return; }
+    if (view === 'reports') { renderReports(); return; }
+    if (view === 'stockvalue') { renderStockValue(); return; }
     renderClosingStock();
   }
 
   function tabsHtml() {
+    const lowCount = Core.lowStockItems().filter(i => (i.location || 'GODOWN') === currentLoc).length;
     return `
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; flex-wrap:wrap; gap:10px;">
         <div style="display:flex; gap:6px; flex-wrap:wrap;">
+          <button class="btn ${view === 'dashboard' ? '' : 'ghost'} sm view-tab" data-view="dashboard">🏠 Dashboard</button>
           <button class="btn ${view === 'si' ? '' : 'ghost'} sm view-tab" data-view="si">📥 Stock In</button>
           <button class="btn ${view === 'so' ? '' : 'ghost'} sm view-tab" data-view="so">📤 Stock Out</button>
+          <button class="btn ${view === 'history' ? '' : 'ghost'} sm view-tab" data-view="history">🕘 History</button>
+          <button class="btn ${view === 'alerts' ? '' : 'ghost'} sm view-tab" data-view="alerts">🔔 Alerts${lowCount ? ` <span class="badge lost" style="margin-left:2px;">${lowCount}</span>` : ''}</button>
+          <button class="btn ${view === 'transfer' ? '' : 'ghost'} sm view-tab" data-view="transfer">🔁 Transfer</button>
+          <button class="btn ${view === 'fastmoving' ? '' : 'ghost'} sm view-tab" data-view="fastmoving">🔥 Fast Moving</button>
+          <button class="btn ${view === 'reports' ? '' : 'ghost'} sm view-tab" data-view="reports">📈 Reports</button>
           <button class="btn ${view === 'stock' ? '' : 'ghost'} sm view-tab" data-view="stock">📊 Closing Stock</button>
           <button class="btn ${view === 'pipestock' ? '' : 'ghost'} sm view-tab" data-view="pipestock">🪠 Pipe Stock</button>
+          <button class="btn ${view === 'stockvalue' ? '' : 'ghost'} sm view-tab" data-view="stockvalue">💰 Stock Value</button>
           <button class="btn ${view === 'master' ? '' : 'ghost'} sm view-tab" data-view="master">🗂 Item Master</button>
           <button class="btn ${view === 'damage' ? '' : 'ghost'} sm view-tab" data-view="damage">🔴 Damage/Return</button>
-          <button class="btn ${view === 'transfer' ? '' : 'ghost'} sm view-tab" data-view="transfer">🔁 Transfer</button>
           <button class="btn ${view === 'partymaster' ? '' : 'ghost'} sm view-tab" data-view="partymaster">👥 Party Master</button>
           <button class="btn ${view === 'partyledger' ? '' : 'ghost'} sm view-tab" data-view="partyledger">📒 Party Ledger</button>
           <button class="btn ${view === 'supplierledger' ? '' : 'ghost'} sm view-tab" data-view="supplierledger">🏷 Supplier Ledger</button>
@@ -2910,6 +2923,375 @@ const Inventory = (() => {
           </tr>`;
         }).join('')}
       </tbody></table>
+    `;
+  }
+
+  /* ---------- DASHBOARD: today + month-over-month summary ---------- */
+
+  function renderInvDashboard() {
+    const main = document.getElementById('main');
+    const td = todayStr();
+    const locItems = Core.listItems({ location: currentLoc });
+    const locItemIds = new Set(locItems.map(i => i.id));
+    const txns = Core._db().stock_ledger.filter(l => locItemIds.has(l.item_id));
+
+    const tIn = txns.filter(t => t.type === 'in' && t.date.slice(0, 10) === td).reduce((s, t) => s + t.qty, 0);
+    const tOut = new Set(txns.filter(t => t.type === 'out' && t.date.slice(0, 10) === td).map(t => t.item_id)).size;
+    const low = locItems.filter(i => i.stock_qty <= i.min_stock && i.min_stock > 0);
+
+    const thisM = td.slice(0, 7);
+    const lastMDate = new Date(); lastMDate.setMonth(lastMDate.getMonth() - 1);
+    const lastM = lastMDate.toISOString().slice(0, 7);
+    const sumQty = (type, month) => txns.filter(t => t.type === type && t.date.slice(0, 7) === month).reduce((s, t) => s + t.qty, 0);
+    const txnCount = (month) => txns.filter(t => t.date.slice(0, 7) === month).length;
+
+    main.innerHTML = `
+      <div class="page-head">
+        <div>
+          <div class="page-title">Inventory Dashboard</div>
+          <div class="page-desc">${currentLoc === 'GODOWN' ? 'Godown' : 'Office'} snapshot — today and this month vs last.</div>
+        </div>
+      </div>
+      ${tabsHtml()}
+
+      <div class="stat-row">
+        <div class="stat"><div class="stat-num">${locItems.length}</div><div class="stat-label">Total Items</div></div>
+        <div class="stat"><div class="stat-num" style="color:${low.length ? 'var(--red)' : 'inherit'}">${low.length}</div><div class="stat-label">Low Stock</div></div>
+        <div class="stat"><div class="stat-num" style="color:var(--green);">${tIn}</div><div class="stat-label">Today IN Qty</div></div>
+        <div class="stat"><div class="stat-num" style="color:#e65100;">${tOut}</div><div class="stat-label">Today OUT Items</div></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">This Month vs Last</div>
+        <div class="stat-row" style="margin-bottom:0;">
+          <div class="stat"><div class="stat-num" style="color:var(--green);">${sumQty('in', thisM)}</div><div class="stat-label">Month IN</div><div class="hint">Last: ${sumQty('in', lastM)}</div></div>
+          <div class="stat"><div class="stat-num" style="color:#e65100;">${sumQty('out', thisM)}</div><div class="stat-label">Month OUT</div><div class="hint">Last: ${sumQty('out', lastM)}</div></div>
+          <div class="stat"><div class="stat-num">${txnCount(thisM)}</div><div class="stat-label">Month Txns</div><div class="hint">Last: ${txnCount(lastM)}</div></div>
+        </div>
+      </div>
+
+      ${low.length ? `
+        <div class="card" style="border-color:#e6c9c5;">
+          <div class="card-title" style="color:var(--red);">⚠ Low Stock (${low.length})</div>
+          ${low.map(i => `<div style="display:flex; justify-content:space-between; padding:6px 0; border-bottom:1px solid var(--paper-dim); font-size:13px;"><span><b>${esc(i.name)}</b> <span class="hint">${esc(i.category || '')} · ${esc(i.brand || '—')}</span></span><span class="badge low">${i.stock_qty} / min ${i.min_stock}</span></div>`).join('')}
+        </div>
+      ` : `<div class="card"><div class="empty">✅ All items adequately stocked.</div></div>`}
+    `;
+    wireTabEvents();
+  }
+
+  /* ---------- ALERTS: dedicated low-stock tab ---------- */
+
+  function renderAlerts() {
+    const main = document.getElementById('main');
+    const low = Core.listItems({ location: currentLoc }).filter(i => i.stock_qty <= i.min_stock && i.min_stock > 0);
+    main.innerHTML = `
+      <div class="page-head">
+        <div>
+          <div class="page-title">Alerts</div>
+          <div class="page-desc">Everything below its minimum stock level in ${currentLoc === 'GODOWN' ? 'Godown' : 'Office'}.</div>
+        </div>
+      </div>
+      ${tabsHtml()}
+      <div class="card">
+        ${low.length ? low.map(i => `
+          <div style="display:flex; justify-content:space-between; align-items:center; padding:10px 0; border-bottom:1px solid var(--paper-dim);">
+            <div>
+              <b>${esc(i.name)}</b>
+              <div class="hint">${esc(i.category || '')}${i.category ? ' · ' : ''}${esc(i.unit)}${i.brand ? ' · ' + esc(i.brand) : ''}</div>
+            </div>
+            <span class="badge low">Stock: ${i.stock_qty} | Min: ${i.min_stock} | Need ${i.min_stock - i.stock_qty} more</span>
+          </div>
+        `).join('') : `<div class="empty">✓ All items adequately stocked.</div>`}
+      </div>
+    `;
+    wireTabEvents();
+  }
+
+  /* ---------- HISTORY: full searchable/filterable transaction log ---------- */
+
+  function renderHistory() {
+    const main = document.getElementById('main');
+    const brands = Core.itemBrands(currentLoc);
+    main.innerHTML = `
+      <div class="page-head">
+        <div>
+          <div class="page-title">History</div>
+          <div class="page-desc">Every stock movement — purchases, sales, damage, returns, and transfers.</div>
+        </div>
+      </div>
+      ${tabsHtml()}
+      <div class="card" style="padding-bottom:10px;">
+        <div class="field-row">
+          <div class="field"><label>Search</label><input id="h-search" placeholder="Item or brand name"></div>
+          <div class="field"><label>Brand</label><select id="h-brand"><option value="">All</option>${brands.map(b => `<option>${esc(b)}</option>`).join('')}</select></div>
+        </div>
+        <div class="field-row">
+          <div class="field"><label>Type</label>
+            <select id="h-type"><option value="">All</option><option value="purchase">Stock In</option><option value="sale_manual">Stock Out</option><option value="damage">Damage</option><option value="return">Return</option><option value="transfer_out">Transfer Out</option><option value="transfer_in">Transfer In</option><option value="sale">Quotation Sale</option></select>
+          </div>
+          <div class="field"><label>From</label><input id="h-from" type="date"></div>
+          <div class="field"><label>To</label><input id="h-to" type="date"></div>
+        </div>
+      </div>
+      <div class="card"><div class="card-title" id="h-count">0 records</div><div id="h-table"></div></div>
+    `;
+    wireTabEvents();
+    ['h-search', 'h-brand', 'h-type', 'h-from', 'h-to'].forEach(id => {
+      const el = document.getElementById(id);
+      el.oninput = renderHistoryTable; el.onchange = renderHistoryTable;
+    });
+    renderHistoryTable();
+  }
+
+  function renderHistoryTable() {
+    const sF = document.getElementById('h-search').value.toLowerCase();
+    const bF = document.getElementById('h-brand').value;
+    const tF = document.getElementById('h-type').value;
+    const dFrom = document.getElementById('h-from').value;
+    const dTo = document.getElementById('h-to').value;
+    const locItemIds = new Set(Core.listItems({ location: currentLoc }).map(i => i.id));
+
+    let list = Core._db().stock_ledger.filter(l => locItemIds.has(l.item_id));
+    if (sF) list = list.filter(l => { const it = Core.getItem(l.item_id); return it && (it.name.toLowerCase().includes(sF) || (it.brand || '').toLowerCase().includes(sF)); });
+    if (bF) list = list.filter(l => { const it = Core.getItem(l.item_id); return it && (it.brand || 'Unknown Brand') === bF; });
+    if (tF) list = list.filter(l => l.ref_type === tF);
+    if (dFrom) list = list.filter(l => l.date.slice(0, 10) >= dFrom);
+    if (dTo) list = list.filter(l => l.date.slice(0, 10) <= dTo);
+    list.sort((a, b) => b.date.localeCompare(a.date));
+
+    document.getElementById('h-count').textContent = `${list.length} record(s)`;
+    const el = document.getElementById('h-table');
+    if (!list.length) { el.innerHTML = `<div class="empty">No transactions match this filter.</div>`; return; }
+    const typeLabel = { purchase: 'IN', sale_manual: 'OUT', sale: 'SALE', damage: 'DAMAGE', return: 'RETURN', transfer_out: 'TRANSFER OUT', transfer_in: 'TRANSFER IN' };
+    el.innerHTML = `
+      <table>
+        <thead><tr><th>Date</th><th>Type</th><th>Item</th><th>Brand</th><th>Qty</th><th>Party</th><th>Ref</th><th>By</th></tr></thead>
+        <tbody>
+          ${list.slice(0, 300).map(l => {
+            const it = Core.getItem(l.item_id);
+            const isIn = l.type === 'in';
+            return `<tr>
+              <td>${fmtDate(l.date)}</td>
+              <td><span class="badge ${isIn ? 'confirmed' : 'lost'}">${typeLabel[l.ref_type] || l.type.toUpperCase()}</span></td>
+              <td style="font-weight:600;">${esc(it ? it.name : '?')}</td>
+              <td style="color:var(--navy-700);">${esc(it ? it.brand || '—' : '—')}</td>
+              <td style="font-weight:700; color:${isIn ? 'var(--green)' : '#e65100'};">${isIn ? '+' : '-'}${l.qty} ${esc(it ? it.unit : '')}</td>
+              <td style="font-size:12px;">${esc(l.party_name || '—')}</td>
+              <td style="font-size:12px;">${esc((l.notes || '').split(' | Remark: ')[0] || '—')}</td>
+              <td>${l.operator ? `<span class="badge new">${esc(l.operator)}</span>` : '—'}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>
+      ${list.length > 300 ? `<div class="hint" style="margin-top:8px;">Showing latest 300 of ${list.length} — narrow the filters to see more precisely.</div>` : ''}
+    `;
+  }
+
+  /* ---------- FAST MOVING: OUT movement grouped by category over a period ---------- */
+
+  function renderFastMoving() {
+    const main = document.getElementById('main');
+    main.innerHTML = `
+      <div class="page-head">
+        <div>
+          <div class="page-title">Fast Moving</div>
+          <div class="page-desc">What's actually going out, grouped by category, over a period.</div>
+        </div>
+      </div>
+      ${tabsHtml()}
+      <div class="card" style="padding-bottom:10px;">
+        <div class="field-row">
+          <div class="field"><label>Period</label>
+            <select id="fm-period"><option value="today">Today</option><option value="7">Last 7 Days</option><option value="30" selected>Last 30 Days</option><option value="custom">Custom Range</option></select>
+          </div>
+        </div>
+        <div class="field-row" id="fm-custom" style="display:none;">
+          <div class="field"><label>From</label><input id="fm-from" type="date"></div>
+          <div class="field"><label>To</label><input id="fm-to" type="date"></div>
+        </div>
+      </div>
+      <div id="fm-results"></div>
+    `;
+    wireTabEvents();
+    const periodEl = document.getElementById('fm-period');
+    periodEl.onchange = () => { document.getElementById('fm-custom').style.display = periodEl.value === 'custom' ? 'flex' : 'none'; renderFmResults(); };
+    document.getElementById('fm-from').onchange = renderFmResults;
+    document.getElementById('fm-to').onchange = renderFmResults;
+    renderFmResults();
+  }
+
+  function renderFmResults() {
+    const period = document.getElementById('fm-period').value;
+    const td = todayStr();
+    let fromDate = '', toDate = td;
+    if (period === 'today') fromDate = td;
+    else if (period === 'custom') { fromDate = document.getElementById('fm-from').value || td; toDate = document.getElementById('fm-to').value || td; }
+    else { const d = new Date(); d.setDate(d.getDate() - Number(period)); fromDate = d.toISOString().slice(0, 10); }
+
+    const locItemIds = new Set(Core.listItems({ location: currentLoc }).map(i => i.id));
+    const filtered = Core._db().stock_ledger.filter(l => l.type === 'out' && locItemIds.has(l.item_id) && l.date.slice(0, 10) >= fromDate && l.date.slice(0, 10) <= toDate);
+    const outByItem = {};
+    filtered.forEach(l => { outByItem[l.item_id] = (outByItem[l.item_id] || 0) + l.qty; });
+
+    const el = document.getElementById('fm-results');
+    if (!Object.keys(outByItem).length) { el.innerHTML = `<div class="card"><div class="empty">No stock movement in this period.</div></div>`; return; }
+
+    const byCat = {};
+    Object.entries(outByItem).forEach(([id, qty]) => {
+      const it = Core.getItem(id);
+      const cat = it ? (it.category || 'Other') : 'Other';
+      (byCat[cat] = byCat[cat] || []).push({ id, qty, it });
+    });
+    Object.values(byCat).forEach(arr => arr.sort((a, b) => b.qty - a.qty));
+    const totalOut = Object.values(outByItem).reduce((s, v) => s + v, 0);
+    const label = period === 'today' ? 'Today' : period === 'custom' ? `${fromDate} to ${toDate}` : `Last ${period} Days`;
+
+    el.innerHTML = `
+      <div class="card">
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; margin-bottom:12px;">
+          <div class="card-title" style="margin-bottom:0; color:#e65100;">🔥 Fast Moving — ${label}</div>
+          <div class="hint">${Object.keys(byCat).length} categories · ${Object.keys(outByItem).length} items · <b style="color:#e65100;">${totalOut} total OUT</b></div>
+        </div>
+        ${Object.keys(byCat).sort().map(cat => `
+          <div style="margin-bottom:14px;">
+            <div style="font-size:12px; font-weight:700; color:var(--navy-700); margin-bottom:6px; text-transform:uppercase; letter-spacing:.03em;">📂 ${esc(cat)}</div>
+            ${byCat[cat].map((row, idx) => `
+              <div style="display:flex; justify-content:space-between; align-items:center; padding:6px 0; border-bottom:1px solid var(--paper-dim);">
+                <span>${idx === 0 ? '🥇' : idx === 1 ? '🥈' : idx === 2 ? '🥉' : '　'} ${esc(row.it ? row.it.name : '?')} ${row.it && row.it.brand ? `<span class="hint">(${esc(row.it.brand)})</span>` : ''}</span>
+                <b style="color:#e65100;">${row.qty} ${esc(row.it ? row.it.unit : '')}</b>
+              </div>
+            `).join('')}
+          </div>
+        `).join('')}
+      </div>
+    `;
+  }
+
+  /* ---------- REPORTS: IN/OUT summary hub for a date range ---------- */
+
+  function renderReports() {
+    const main = document.getElementById('main');
+    main.innerHTML = `
+      <div class="page-head">
+        <div>
+          <div class="page-title">Reports</div>
+          <div class="page-desc">IN/OUT summary for a date range, plus quick links to the detailed reports.</div>
+        </div>
+      </div>
+      ${tabsHtml()}
+      <div class="card" style="padding-bottom:10px;">
+        <div class="field-row">
+          <div class="field"><label>From</label><input id="rp-from" type="date"></div>
+          <div class="field"><label>To</label><input id="rp-to" type="date"></div>
+        </div>
+      </div>
+      <div id="rp-summary" class="stat-row"></div>
+      <div class="card">
+        <div class="card-title">Jump to a detailed report</div>
+        <div style="display:flex; gap:8px; flex-wrap:wrap;">
+          <button class="btn ghost sm view-tab" data-view="fastmoving">🔥 Fast Moving</button>
+          <button class="btn ghost sm view-tab" data-view="stockvalue">💰 Stock Value</button>
+          <button class="btn ghost sm view-tab" data-view="pipestock">🪠 Pipe Stock</button>
+          <button class="btn ghost sm view-tab" data-view="alerts">🔔 Low Stock</button>
+          <button class="btn ghost sm view-tab" data-view="history">🕘 Full History</button>
+        </div>
+      </div>
+      <div class="card"><div class="card-title">Breakdown by Type</div><div id="rp-breakdown"></div></div>
+    `;
+    wireTabEvents();
+    document.getElementById('rp-from').onchange = renderRpSummary;
+    document.getElementById('rp-to').onchange = renderRpSummary;
+    renderRpSummary();
+  }
+
+  function renderRpSummary() {
+    const from = document.getElementById('rp-from').value;
+    const to = document.getElementById('rp-to').value;
+    const locItemIds = new Set(Core.listItems({ location: currentLoc }).map(i => i.id));
+    let list = Core._db().stock_ledger.filter(l => locItemIds.has(l.item_id));
+    if (from) list = list.filter(l => l.date.slice(0, 10) >= from);
+    if (to) list = list.filter(l => l.date.slice(0, 10) <= to);
+
+    const inQty = list.filter(l => l.type === 'in').reduce((s, l) => s + l.qty, 0);
+    const outQty = list.filter(l => l.type === 'out').reduce((s, l) => s + l.qty, 0);
+    document.getElementById('rp-summary').innerHTML = `
+      <div class="stat"><div class="stat-num">${list.length}</div><div class="stat-label">Transactions</div></div>
+      <div class="stat"><div class="stat-num" style="color:var(--green);">${inQty}</div><div class="stat-label">Total IN Qty</div></div>
+      <div class="stat"><div class="stat-num" style="color:#e65100;">${outQty}</div><div class="stat-label">Total OUT Qty</div></div>
+    `;
+    const byType = {};
+    list.forEach(l => { byType[l.ref_type] = (byType[l.ref_type] || 0) + 1; });
+    const typeLabel = { purchase: 'Stock In', sale_manual: 'Stock Out', sale: 'Quotation Sale', damage: 'Damage', return: 'Return', transfer_out: 'Transfer Out', transfer_in: 'Transfer In' };
+    document.getElementById('rp-breakdown').innerHTML = Object.keys(byType).length ? Object.entries(byType).map(([k, v]) => `
+      <div style="display:flex; justify-content:space-between; padding:6px 0; border-bottom:1px solid var(--paper-dim); font-size:13px;">
+        <span>${typeLabel[k] || k}</span><b>${v}</b>
+      </div>`).join('') : `<div class="empty">No transactions in this range.</div>`;
+  }
+
+  /* ---------- STOCK VALUE: purchase/sell value by brand ---------- */
+
+  function renderStockValue() {
+    const main = document.getElementById('main');
+    const brands = Core.itemBrands(currentLoc);
+    main.innerHTML = `
+      <div class="page-head">
+        <div>
+          <div class="page-title">Stock Value</div>
+          <div class="page-desc">What's sitting in stock is worth, at cost and at sell price.</div>
+        </div>
+      </div>
+      ${tabsHtml()}
+      <div class="card" style="padding-bottom:10px;">
+        <label>Brand</label>
+        <select id="sv-brand"><option value="">— All Brands —</option>${brands.map(b => `<option>${esc(b)}</option>`).join('')}</select>
+      </div>
+      <div id="sv-summary" class="stat-row"></div>
+      <div class="card"><div id="sv-table"></div></div>
+    `;
+    wireTabEvents();
+    document.getElementById('sv-brand').onchange = renderSvTable;
+    renderSvTable();
+  }
+
+  function renderSvTable() {
+    const brandF = document.getElementById('sv-brand').value;
+    let list = Core.listItems({ location: currentLoc });
+    if (brandF) list = list.filter(i => (i.brand || 'Unknown Brand') === brandF);
+
+    let totalPurchase = 0, totalSell = 0, withRate = 0;
+    list.forEach(i => {
+      if (i.cost_price || i.sell_price) withRate++;
+      totalPurchase += i.stock_qty * (i.cost_price || 0);
+      totalSell += i.stock_qty * (i.sell_price || 0);
+    });
+    document.getElementById('sv-summary').innerHTML = `
+      <div class="stat"><div class="stat-num">${list.length}</div><div class="stat-label">Total Items</div></div>
+      <div class="stat"><div class="stat-num">${withRate}</div><div class="stat-label">Items With Rate</div></div>
+      <div class="stat"><div class="stat-num" style="color:var(--green);">₹${totalPurchase.toLocaleString('en-IN', { maximumFractionDigits: 0 })}</div><div class="stat-label">Purchase Value</div></div>
+      <div class="stat"><div class="stat-num" style="color:#e65100;">₹${totalSell.toLocaleString('en-IN', { maximumFractionDigits: 0 })}</div><div class="stat-label">Sell Value</div></div>
+    `;
+    const tbl = document.getElementById('sv-table');
+    if (!list.length) { tbl.innerHTML = `<div class="empty">No items found.</div>`; return; }
+    tbl.innerHTML = `
+      <table>
+        <thead><tr><th>Item</th><th>Brand</th><th>Stock</th><th>Unit</th><th>Cost Rate</th><th>Sell Rate</th><th>Purchase Value</th><th>Sell Value</th></tr></thead>
+        <tbody>
+          ${list.sort((a, b) => a.name.localeCompare(b.name)).map(i => {
+            const pv = i.stock_qty * (i.cost_price || 0), sv = i.stock_qty * (i.sell_price || 0);
+            return `<tr>
+              <td style="font-weight:600;">${esc(i.name)}</td>
+              <td style="color:var(--navy-700);">${esc(i.brand) || '—'}</td>
+              <td style="font-weight:700;">${i.stock_qty}</td>
+              <td>${esc(i.unit)}</td>
+              <td>₹${i.cost_price}</td>
+              <td>₹${i.sell_price}</td>
+              <td style="font-weight:700; color:var(--green);">₹${pv.toLocaleString('en-IN', { maximumFractionDigits: 0 })}</td>
+              <td style="font-weight:700; color:#e65100;">₹${sv.toLocaleString('en-IN', { maximumFractionDigits: 0 })}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>
     `;
   }
 
